@@ -667,9 +667,10 @@ hold it (§5.3).
                             replicated bool, checked u64 ns, verified u64 ns}
    pin/<tail>              barrier counter at pin time (§9.5)
    gc                      {barrier counter → (epoch, eligible_below) history,
-                            overflowed counts, last inserted count}
+                            overflowed counts, last marked count}
    xfer/<id>/<round>       transition pass progress (last pack done, deferred packs)
-<store>/gc/                this node's Bloom filter and the mark placement for the current epoch
+<store>/gc/                this node's mark for the current epoch: one bitmap per
+                            pack, plus the placement it was marked against
 ```
 
 ### 6.2 Writes
@@ -756,7 +757,9 @@ every batch.
 
 `missing` is the same primitive without the bytes and serves both the
 writer's negotiation and the reference gate; `pin: true` makes it an
-atomic has-and-pin (§9.5). It answers *present* only for records that
+atomic has-and-pin (§9.5). A key the node holds only as a record it has
+found corrupt (§8.4) is answered *missing*, so a good copy is sent and
+not deduplicated away. It answers *present* only for records that
 are durable: a hit in the active segment beyond its last synced offset
 makes the node sync once for the whole batch before replying (one fsync
 per ≤ 8192 keys), so a writer that prunes a key as present, or a
@@ -1088,14 +1091,14 @@ count for the second.)
 - **Garbage is not forwarded.** A key that is *proved dead* is skipped:
   the node would delete it at its next sweep anyway. "Proved dead" means
   clause 1 of §9.6 evaluated at that moment with exactly the state the
-  node's next sweep batch would use — the newest complete filter and the
+  node's next sweep batch would use — the newest complete mark and the
   placement it was marked against (the node owned the key under it), the
   current pin set, the current eligibility bound, and no overflow on any
   count that sweep honours; if any honoured count is overflowed, nothing
-  is proved dead and everything is offered. Never an older filter: a pin
-  that the current filter's epoch has not yet superseded is still in the
+  is proved dead and everything is offered. Never an older mark: a pin
+  that the current mark's epoch has not yet superseded is still in the
   set and protects the key. A key the node holds without owning is never
-  proved dead (its filter says nothing about it, §9.6) and is always
+  proved dead (its mark says nothing about it, §9.6) and is always
   offered. Without this
   rule a rebalance copies every byte of garbage (a quarter of the store
   in core's benchmark workload) to its new owners. What closes the rule:
@@ -1121,9 +1124,13 @@ count for the second.)
   derived bookkeeping, never the source of truth about what exists. When
   a target rejects a record as failing verification, the holder
   re-verifies its own copy: if it is corrupt locally, the record is
-  logged, marked `corrupt` in `meta` and treated as absent (the other
-  holders have good copies and the next audit refills this one); if it
-  is good, the target is at fault and is counted as failed for the pack.
+  logged, marked `corrupt` in `meta` and treated as absent — `missing`
+  reports it missing (§6.3), the refill lands through core's
+  `PutVerified`, which repairs the record in place and keeps its pack
+  and footer position (so mark bitmaps stay aligned), and the sweep
+  treats a corrupt record as dead so a bad copy never wedges a
+  compaction (§9.6); if it is good, the target is at fault and is
+  counted as failed for the pack.
   One bad node can thus neither block every transition nor talk the
   cluster out of a good record.
 - **Ex-members hand data back.** A node that learns a committed view it
@@ -1196,19 +1203,20 @@ recomputes liveness from scratch in numbered **epochs**: a barrier
 snapshots the roots consistently with in-flight reference writes, a
 distributed mark walks every root — each node expanding the tree objects
 it owns and streaming every live key to that key's owners — and every
-node summarises the keys it was sent as a Bloom filter and sweeps its own
-packs with `Compact` using the filter as the live predicate. Between
-epochs a node keeps only its last filter with the placement it was marked
-against — what a restart resumes a sweep with, and what the reconcile
-pass consults to skip proven garbage (§8.4) — and its last live count,
-used to size the next filter.
+node marks the keys it was sent into a **bitmap over its own records**,
+one bit per record, and sweeps its own packs with `Compact` using the
+bitmap as the live predicate. Between epochs a node keeps only its last
+mark with the placement it was marked against — what a restart resumes a
+sweep with, and what the reconcile pass consults to skip proven garbage
+(§8.4) — and its last live count, for `status`.
 
-The probabilistic part is safe by construction: a Bloom filter has no
-false negatives — a live key is always reported present — and a false
-positive only retains a dead object until a later epoch. What must be
-exact is everything that decides *what is reachable*: the roots snapshot,
-the walk, and the protection of objects that become reachable while the
-epoch runs.
+The mark is exact: a bit is set for a record if and only if some
+reference reached it in the snapshot's roots, so nothing live is ever
+reaped and no garbage is ever retained by a false positive. (The brief
+suggested a probabilistic set; §9.4 says why the exact bitmap is both
+smaller and simpler here.) What must also be exact is everything that
+decides *what is reachable*: the roots snapshot, the walk, and the
+protection of objects that become reachable while the epoch runs.
 
 ### 9.1 The epoch
 
@@ -1244,7 +1252,7 @@ the epoch to the reference path:
   whoever starts them: the periodic loop, `dstore gc run` (which waits
   for `barrier_at + gc_interval`, printing until when, or is refused
   `too-soon`; `gc run --garbage F` re-runs only the sweep with the
-  filters the nodes already hold and needs no barrier), a catalog
+  marks the nodes already hold and needs no barrier), a catalog
   restore or a recovery (both write `barrier_at = now`). As defence in
   depth, a node refuses to ack a barrier less than `gc_interval − skew`
   after its previous ack by its own clock — exclusion is always safe.
@@ -1288,7 +1296,7 @@ completed into a root or fenced forever — an in-flight delete cannot
 hide a root that a later read would bring back, and an in-flight create
 cannot appear after the sweep. Nodes that did not ack are *excluded*
 from epoch `g`: they are not workers, receive no keys, and run no sweep
-for it. That is safe for them (nothing is deleted without a filter) and,
+for it. That is safe for them (nothing is deleted without a mark) and,
 because of the pin rule (§9.5), safe for everyone else; a node is
 excluded only if it does not answer within a minute — down, unreachable,
 or stalled — never because it is coordinating work.
@@ -1320,19 +1328,20 @@ acked the barrier, so in the common case the node that expands a tree
 object already holds it. Workers are all acked data nodes.
 
 The coordinator starts every worker with `gc-mark {g, nonce, params}` —
-`params` being the epoch's placement snapshot and filter salt —
+`params` being the epoch's placement snapshot —
 and then delivers the roots as ordinary key batches: an interior root
 goes to its worker as `gc-keys {expand: true}`, a leaf root to its owners
 as `gc-keys {expand: false}`, ≤ 8192 keys per batch — the coordinator is
 one more sender in the termination accounting below. (A single message
 carrying 10^6 roots would not fit a frame.) Each worker keeps a queue of keys to process, an exact
 **visited set** of the interior keys it has expanded (full 32-byte keys;
-never leaves, which need no pruning, and never the Bloom filter, whose
-false positive would prune a subtree that was never walked and lose its
-descendants), and an outbound batch per other node. Processing `k`:
+never leaves, which need no pruning, and never the mark bitmap: a bit
+says a key is live, not that its subtree has been expanded — expansion is
+the worker's job, and its visited set is what prunes), and an outbound
+batch per other node. Processing `k`:
 
 ```
-deliver(k): append k to the batch for every acked owner of k   // for their filters
+deliver(k): append tail(k) to the batch for every acked owner of k   // for their marks
 if k is a Blob or XattrSet:      deliver(k); done               // leaves are never read
 elif worker(k) ≠ self:           deliver(k); append k to the batch for worker(k) ("expand")
 elif k ∈ visited:                done                            // exact prune
@@ -1345,9 +1354,21 @@ else: visited += k; deliver(k)
 Batches (`gc-keys {g, nonce, seq, keys[], expand: bool}`, ≤ 8192 keys,
 flushed every 50 ms) are accepted only from acked nodes at epoch `g`;
 `seq` numbers a sender's batches to one receiver, so a batch re-sent
-after a lost ack is recognised, re-acked and counted once; a receiver
-inserts the keys into its filter and, for `expand` batches, enqueues
-them. The coordinator sends no root until every worker has acked its
+after a lost ack is recognised, re-acked and counted once. A delivery
+batch carries 8-byte key tails — all a receiver needs to find its own
+record, and a quarter of the bytes; a tail collision marks an extra
+record live, the safe direction — while an `expand` batch carries full
+keys, since the worker must fetch the objects. A receiver **marks** each
+tail: it looks the tail up in its key index (§15), which yields *every*
+record with that tail — the index is a multimap: two keys can share a
+tail (and then share a slot and owners, since the slot is the tail's top
+bits), and a record the node holds twice has two locations — and sets
+the bit of each of them; a tail it does not hold is dropped (the record
+is not this node's to keep), and a location at or above `eligible_below`
+is skipped (young records are exempt, §9.5). Marking every location is
+what makes a clear bit mean "dead": a mark that chose one copy would
+let the sweep delete the other. For `expand` batches the receiver also
+enqueues the keys. The coordinator sends no root until every worker has acked its
 `gc-mark`, so no forward can reach a worker that has not started. The
 processing loop never blocks on a send: outbound batches queue per
 destination and spill to a local file past a threshold (64 MB), inbound
@@ -1363,19 +1384,24 @@ per worker and a subtree has one worker per interior key.
 **Termination.** Every sender — each worker and the coordinator — counts
 batches *created* (at enqueue, so a batch waiting to be retried still
 counts) and batches received, and reports `{sent, received, idle,
-missing[], inserted}` to `gc-status` polls every second. *Idle* means:
-nothing queued, nothing being expanded, no outbound batch unacked. The
+missing[], marked}` to `gc-status` polls every second. *Idle* means:
+nothing queued, nothing being expanded, no outbound batch unacked, and
+the bitmaps as they stand **fsynced** to `<store>/gc/mark-g/` with the
+epoch, the node's barrier count, `eligible_below` and the placement —
+re-persisted whenever a batch has arrived since the last report — so
+that the mark the coordinator declares complete exists on disk on every
+node before the phase changes. The
 coordinator starts polling only after its own root batches have all been
 acked, and declares the mark complete when two consecutive polls show
 every worker idle, no counter changed, and `Σsent = Σreceived` over all
 senders (a batch in flight or awaiting retry is a count mismatch); a
 mark that has not completed within `mark_timeout` (default 1 h) is
 abandoned like any other failed phase (§9.8); it CASes
-`mark_done = true` with each node's `inserted` count (next epoch's
-sizing) and `phase = sweep`. A `gc-keys` batch that arrives after that
+`mark_done = true` with each node's `marked` count and
+`phase = sweep`. A `gc-keys` batch that arrives after that
 is refused (`mark-frozen`) and reported by its sender in `gc-status`; a
 coordinator that sees any refusal aborts the epoch rather than sweep with
-a filter that missed a key — a late batch can only mean the termination
+a mark that missed a key — a late batch can only mean the termination
 check was wrong, and silent loss is the one thing this design must not
 do. A
 missing object — *absent* at every owner, each of which answered —
@@ -1394,27 +1420,43 @@ mark state for that `(g, nonce)` — it restarted mid-mark — answers an
 error, and any such answer aborts the epoch rather than let a worker
 that lost its queue pass the termination check with empty counters.
 
-**The filter.** Each node owns one Bloom filter per epoch over the keys
-it was delivered, with `k = 7` probes by double hashing from the key's
-own hash bytes and an epoch salt — `h1 = BE64(key[16:24]) ⊕ s1`,
-`h2 = (BE64(key[24:32]) ⊕ s2) | 1`, probe `i` at `(h1 + i·h2) mod m`,
-`s1‖s2 = BLAKE3("amber-dstore/gc-salt" ‖ g)[0:16]` — so building and
-testing it needs no hashing and is identical in every implementation, and
-a dead object that survived one epoch by a false positive survives the
-next with independent probability. `m` is the smallest power of two
-≥ 16·n̂, where `n̂` is 1.25 × the larger of this node's `inserted` count
-last epoch and its stored object count. At 16 bits per key the
-false-positive rate is ≈ 0.1 %; a filter that receives more than `n̂`
-keys still works (the rate degrades), reports `overfull`, and is sized up
-next epoch. The filter is written to `<store>/gc/filter-g` when the mark
-completes, so a restart before the sweep loses nothing. Bloom rather than
-binary-fuse/xor because it is built incrementally from a stream of keys
-arriving from many workers; xor filters need the whole key set first.
-(Rejected: root-partitioned workers fetching interior objects over the
-network — every interior object crosses the wire once per worker that
-reaches it, ~500 GB at 10^9 objects, and shared subtrees are walked once
-per worker; a global filter merged and distributed by the coordinator —
-N× the filter through one node.)
+**The mark bitmap.** A node's mark for epoch `g` is one bitmap per
+sealed pack below `eligible_below`, one bit per record in the pack's
+footer order — the shape core's `packstore.MarkSet` keeps for the
+single-node collector (a bitmap per sealed segment, sized from the
+footer's record count), once it locates through the key index rather
+than by probing pack filters and holds segment ids rather than cloned
+footers (§15). At 1.5·10^7 records per node the bitmaps are under 2 MB;
+a 6·10^7-record node marks in 8 MB. Marking a delivered tail costs one
+index lookup, ~1 µs, so a node marks its whole share in seconds of CPU,
+spread over the mark.
+The bitmaps live under `<store>/gc/mark-g/`, one file per pack, with
+the placement the mark ran against and the node's barrier count, synced
+before every idle report (above), so a restart before or during the
+sweep loses nothing; a node that finds no complete `mark-g/` at restart
+while `gc` says epoch `g` is sweeping CASes `sweep_done` for `g` with
+`no_mark` and does not sweep it — and a sweep takes its pin horizon and
+`eligible_below` from the mark file's own count, never from the
+register's epoch. A pack that is unlinked takes its bitmap with it. A mark tolerates the previous
+epoch's sweep still running: it never holds a segment's mapping, only
+its id, and a record that sweep copies forward lands above
+`eligible_below`, exempt, while the copy left behind in the victim is
+unlinked with it.
+
+(Rejected: a probabilistic filter over the delivered keys. At a 0.1 %
+false-positive rate a Bloom filter costs 16 bits per live key, a cuckoo
+filter ~13.5, a binary fuse filter — already a core dependency, in the
+pack footers — ~11.3 but only from a complete key set, so the mark would
+have to buffer every delivered key first. All of them need a size guess
+from the previous epoch and a story for overfilling, and all retain a
+little garbage per epoch by false positives. The bitmap is one bit per
+record the node holds, exact, and needs the key index the design
+requires anyway; the only thing it cannot express is liveness of a
+record the node does not hold, which no sweep needs. Also rejected:
+root-partitioned workers fetching interior objects over the network —
+every interior object crosses the wire once per worker that reaches it,
+~500 GB at 10^9 objects, and shared subtrees are walked once per
+worker.)
 
 ### 9.5 Pins
 
@@ -1451,7 +1493,7 @@ rate.
 > **P:** a sweep for the epoch acked at count `c` honours every pin
 > stamped `≥ c − 1` (and, by the exemption, leaves every record appended
 > since ack `c − 1` alone). A pin stamped `c` is dropped when the node
-> starts sweeping with a filter whose epoch it acked at count `c + 2` or
+> starts sweeping with a mark whose epoch it acked at count `c + 2` or
 > later.
 
 *Why.* The argument is anchored at the reference gate's visit, never at
@@ -1469,7 +1511,7 @@ the snapshot of the epoch acked at `c + 2` is more than `put_ttl` after
 `t_g`. By then `P`'s own accept has landed or been refused (`not_after`,
 fixed at `P`'s start, which precedes `t_g`), and the snapshot settles
 the register (§9.2): either the reference is decided — it is a root,
-`k` is in `o`'s filter, no protection is needed — or `P`'s proposal is
+`k`'s bit is set in `o`'s mark, no protection is needed — or `P`'s proposal is
 fenced and can never become a reference. Nothing here depends on which
 epoch `o` or the coordinator was at, on whether either was excluded from
 some barrier, or on cycles abandoned before their snapshot (barriers,
@@ -1515,7 +1557,7 @@ When `gc.phase = sweep`, each acked node — in waves of at most a quarter
 of the nodes at a time, which the coordinator releases through
 `gc.sweep_wave` so that no more than a quarter of the cluster's append
 bandwidth is ever spent on copying — scores its sealed packs once
-against its filter, its pins and the mark placement into an ordered
+against its mark, its pins and the mark placement into an ordered
 victim list (dead ratio descending), then runs `Compact(live, opts)`
 over it in batches of at most `MaxCopyBytes` (default 1 GiB) of
 victims, over the packs with id below the *previous* ack's
@@ -1523,7 +1565,7 @@ victims, over the packs with id below the *previous* ack's
 the same policy knob as core). Each batch's victims are unlinked as soon as
 its copies are durable, so a sweep never needs more transient space than
 one batch. From here on the node's sweep depends on nothing the
-coordinator holds — only its own filter, the placement it was marked
+coordinator holds — only its own mark, the placement it was marked
 against, its pins and the current view — so a coordinator change or an
 aborted next epoch cannot invalidate it. A batch copies its survivors taking the
 packstore's append lock per record, so uploads interleave with the copy;
@@ -1536,12 +1578,12 @@ record `k` in pack `p` is **dead** when either clause holds, and live
 otherwise:
 
 1. *garbage:* the node **owned** `k` under the placement the mark ran
-   against (`gc.placement`, kept next to the filter — `nodes` and
-   `pending.nodes` as they were at `phase = mark`), and `k ∉ filter`, and
-   `k` is not pinned (§9.5). A filter says nothing about keys its node did
-   not own when the mark ran: the mark delivers a key to its owners only
-   (§9.4), so for a record the node merely holds, `k ∉ filter` is no
-   evidence at all, and only clause 2 can ever declare it dead;
+   against (`gc.placement`, kept next to the bitmaps — `nodes` and
+   `pending.nodes` as they were at `phase = mark`), and the record's bit
+   is clear, and `k` is not pinned (§9.5). A mark says nothing about keys
+   its node did not own when the mark ran: the mark delivers a key to its
+   owners only (§9.4), so for a record the node merely holds, a clear bit
+   is no evidence at all, and only clause 2 can ever declare it dead;
 2. *not mine:* `n ∉ owners(k, nodes)`, and if `pending` is set also
    `n ∉ owners(k, pending.nodes)`, `k` is not pinned, and `p` is settled
    (§8.4) — the node has offered `k` to every current owner and each
@@ -1556,9 +1598,15 @@ otherwise:
    otherwise a single multi-day outage would freeze reclamation of
    ordinary garbage on every node.
 
-Clause 1 is garbage collection; clause 2 is the drop half of rebalancing
-and needs no filter — a node may run an *ownership-only* compaction (only
-clause 2) at any time. `Compact` then does what it does in core: rewrites
+A record marked `corrupt` (§8.4) is dead under either clause: it cannot
+be read, its refill arrives through `PutVerified`, and a compaction must
+not stall on it. And a record the node holds twice is copied forward
+unless a copy survives outside *this sweep's whole victim list* — never
+merely outside the current batch — so two victims in different batches
+cannot each leave the copy to the other (§15). Clause 1 is garbage
+collection; clause 2 is the drop half of rebalancing and needs no mark —
+a node may run an *ownership-only* compaction (only clause 2) at any
+time. `Compact` then does what it does in core: rewrites
 the packs whose dead fraction is over the line (policy 0.5; 0.1 under
 min-free pressure), verifying every live record while copying, fsyncing,
 unlinking victims last. Between batches pins and PUT walks proceed; a
@@ -1569,17 +1617,18 @@ epoch idle when every acked node is done or `sweep_timeout` (default 6 h)
 passes.
 
 A sweep is not cut by the next barrier: the node acks the barrier between
-two batches and keeps sweeping with the filter it has — the pin rule is
+two batches and keeps sweeping with the mark it has — the pin rule is
 stated per sweep epoch, not per current count — until the next epoch's
-filter is complete, then switches filter, `eligible_below` and victim
-list between batches. A node that restarts resumes with its persisted
-filter. Victims with no live record at all are unlinked first without
+mark is complete, then switches mark, `eligible_below` and victim list
+between batches. A node that restarts resumes with its persisted mark. Victims with no live record at all are unlinked first without
 copying anything, and a node keeps a headroom of `MaxCopyBytes` plus one
 segment below which it refuses uploads (`no-space`, retryable) but still
 sweeps: a full disk must always have a way out. packstore's own `Verify` is
-never scheduled by dstore (the reconcile worker scrubs, §8.4), and until
-core has per-segment scrub pins it must not run alongside a sweep,
-since pack removal waits for in-flight scrubs. Space reclamation after a join is lazy by the same
+never scheduled by dstore (the reconcile worker scrubs, §8.4); pack
+removal today waits on a global gate that every index scan and record
+read takes, which is why §15 asks for per-segment pins before the first
+version — the reconcile pass reads packs all the time, and a batch tail
+must not wait on it. Space reclamation after a join is lazy by the same
 policy line core uses: a node that lost 5 % of its keys to a newcomer
 keeps them until ordinary garbage pushes each pack over the line, or
 min-free pressure lowers it.
@@ -1596,10 +1645,10 @@ rules that make it safe:
   worker computes worker assignment and key delivery from that snapshot,
   never from a view adopted later;
 - keys are delivered to their owners under both sets; a node that is not
-  an owner under either at mark time gets no filter and is excluded from
+  an owner under either at mark time gets no mark and is excluded from
   the epoch's sweep — in particular a node that joins during a mark waits
   for the next epoch to sweep anything — and a node that owns some keys
-  and merely holds others judges only the former by its filter (§9.6);
+  and merely holds others judges only the former by its mark (§9.6);
 - a sweep during a transition may copy survivors from a pack the
   transition pass has not reached yet into a new segment; §8.5's
   seal-and-cover loop before `done` is what still offers them;
@@ -1616,7 +1665,7 @@ Every phase is idempotent and its state is in `gc`. When the lease
 expires, the next holder reads `gc`: an epoch in `barrier` or `mark` is
 abandoned (`phase = aborted`; the next epoch is `g+1`, and its barrier is
 scheduled `gc_interval` after `g`'s `barrier_at`); one in `sweep` is
-simply observed to completion — the filters are on the nodes, so nothing
+simply observed to completion — the marks are on the nodes, so nothing
 of the old coordinator's is needed. Nodes that were mid-mark drop their
 queues when they see the abort; nodes mid-sweep finish their batch and
 continue, since a sweep depends on nothing the coordinator held (§9.6).
@@ -1626,10 +1675,10 @@ continue, since a sweep depends on nothing the coordinator held (§9.6).
 | | 10^8 objects, 20 nodes, R=3 | 10^9 objects, 50 nodes, R=3 |
 |---|---|---|
 | interior objects expanded (≈2 %), read locally | 2·10^6 | 2·10^7 |
-| key traffic (R × 32 B per live key, plus expand batches) | ~10 GB total, 0.5 GB/node | ~100 GB total, 2 GB/node |
+| key traffic (R × 8 B tails per live key, plus full-key expand batches) | ~2.5 GB total, 130 MB/node | ~25 GB total, 500 MB/node |
 | mark wall time (local reads + LAN key streams) | tens of seconds | minutes |
 | per-node visited set (32 B × interior keys it expands) | ~3 MB | ~13 MB |
-| per-node filter (16 bits × its share, R/N) | 30 MB | 120 MB |
+| per-node mark (1 bit per record held) | 2 MB | 8 MB |
 | per-node sweep: index scan + Compact victims | seconds + copy time | same shape |
 
 Compare core: a single-node mark of 5·10^5 objects takes 0.5 s. The
@@ -1688,8 +1737,8 @@ privileged client), plus:
 | `prepare`, `accept`, `scan`, `install`, `purge` | catalog (§5.3) |
 | `gc-barrier {g}` → `ok` | the ack itself is the node's CAS into `gc.acked` (§9.2) |
 | `gc-mark {g, nonce, params}` | start a worker (§9.4) |
-| `gc-keys {g, nonce, seq, keys[], expand}` → `ack` | live keys for the receiver's filter; `expand` = also traverse; roots arrive this way too (§9.4) |
-| `gc-status {g, nonce}` → `{sent, received, idle, inserted, missing[]}` | mark termination polling (§9.4) |
+| `gc-keys {g, nonce, seq, keys[], expand}` → `ack` | live key tails for the receiver's mark; `expand` batches carry full keys and are also traversed; roots arrive this way too (§9.4) |
+| `gc-status {g, nonce}` → `{sent, received, idle, marked, missing[]}` | mark termination polling (§9.4) |
 | `view-changed {epoch}` (gossip payload) | latency hint (§5.5) |
 
 Transition progress (`participants_ack`, `participants`, `done`) and GC
@@ -1921,7 +1970,7 @@ backup, gateway mode, the benchmark. Simulation and the Quint models
 | node size | 10–20 TiB per node while packstore maps whole segments (§13); beyond that needs bodies read by `pread` |
 | page tables | ~2 GiB per TiB of pack bytes read through mmap, freed only at unmap (§13) |
 | reconcile key lists | 32 B per key per target owner |
-| Bloom filter | 2 B per live key of the node's share |
+| mark bitmap | 1 bit per record the node holds; the delivered tails are not stored |
 | visited set | 32 B per interior key the node expands (≈2 % of its share) |
 
 Ranking a slot is the only O(N) cost (~3 µs at 50 nodes, once per slot
@@ -1937,7 +1986,7 @@ Small, additive changes in `github.com/amber-store/core`:
    it internally today); needed so a transition's pass has a finite set of
    packs (§8.2) and for `seal_after` (§8.4). GC does not need it.
 2. `packstore.Store.Count()` or `SegmentInfo.Keys` exposed for the
-   barrier ack and filter sizing (§9.4).
+   barrier ack and for sizing each pack's mark bitmap (§9.4).
 3. `Compact` reshaped for a long-running sweep (§9.6): its
    `live func(key.Key) bool` stays the predicate; add
    `CompactOpts.Victims []uint64` (score once, pass an ordered list; today
@@ -1948,7 +1997,14 @@ Small, additive changes in `github.com/amber-store/core`:
    and a copy loop that takes the append lock per record with only the
    final delta re-check, fsync and unlink under the exclusive section —
    today `Compact` holds the append lock for the whole call, which would
-   stop a node's ingest for the duration of its sweep. A failed seal or
+   stop a node's ingest for the duration of its sweep. Three more
+   details matter once a sweep is batched: a survivor is a copy outside
+   the *whole* sweep's victim list, not outside the batch (today's
+   `survivorHas` is per call, so two batches could each leave a
+   duplicate to the other); a record that fails verification while
+   copying is skipped and reported, not fatal to the batch; `Compact`
+   does not seal the active segment per call, and `Victims` tolerates an
+   id a previous sweep already unlinked. A failed seal or
    append (ENOSPC) must not poison the store permanently: today
    `setFailed` is sticky until restart, and a full node has to be able
    to sweep its way out and resume.
@@ -1966,13 +2022,25 @@ Small, additive changes in `github.com/amber-store/core`:
    dstore refuses to open a store whose next id is below its recorded
    `eligible_below` or `seal`, and deletes a pack's stamp when the pack
    is unlinked.
-6. Per-segment scrub pins instead of the global scrub gate, so `Verify`
-   and pack removal can coexist; until then dstore does not run both.
-7. A node-level key→segment index in packstore (`tail → segment id`,
-   rebuilt from the footers at open, maintained at seal and by Compact;
-   Pebble or a compact in-RAM table), consulted by `Has`, `Missing`,
-   `Get` and the mark set before any per-pack filter probe. Required
-   from the first version: without it every absent-key lookup is
+6. Per-segment scrub pins instead of the global scrub gate, which
+   `ScanIndex` and `Record` take too — the reconcile pass reads packs
+   continuously, so pack removal must wait only on readers of *that*
+   pack. Required from the first version.
+7. A node-level key index in packstore — a **multimap**
+   `tail → [(segment id, footer position)]`, since two keys may share a
+   tail and a record may be held twice; rebuilt from the footers at
+   open, maintained at seal and by Compact; Pebble or a compact in-RAM
+   table — consulted by `Has`, `Missing`, `Get` (comparing full keys
+   across all entries) before any per-pack filter probe, and by the GC
+   mark through a `MarkTail(tail)` that sets every matching bit (§9.4).
+   `MarkSet` should then hold segment ids and bitmaps only — today it
+   clones every footer's index at construction, ~44 bytes per key, and
+   locates newest-first through the pack filters — so a sweep may unlink
+   a segment while a mark is in progress. Also close the dedup race at a
+   segment boundary: `Put` checks `Has` and then appends under a
+   different lock, so two concurrent writes of one key can land in two
+   segments; re-check under the append lock. Required from the first
+   version: without it every absent-key lookup is
    O(packs), and negotiation, reconcile and the mark are quadratic in
    store size (core's own note on `MarkSet.locate` at 599 packs is this
    effect).
@@ -2063,8 +2131,10 @@ Choices made here that the reader may want to change:
 5. **Reference PUTs are coordinated by a node**: the completeness walk
    is many small owner round trips, best done on the LAN; a client could
    run it itself at WAN cost with no change to the GC argument (§7).
-6. **The mark is owner-partitioned** and each node builds its own Bloom
-   filter from streamed keys (§9.4); the simpler root-partitioned mark
+6. **The mark is owner-partitioned** and each node marks streamed key
+   tails into an exact bitmap over its own records (§9.4), one bit per
+   record — the brief's probabilistic set was rejected as both larger
+   (16 bits per key) and less precise; the simpler root-partitioned mark
    with remote fetches would do for small clusters but not at 10^9.
 7. **Client access is open by default**, like transport-iroh (§2) — which
    makes a cluster whose nodes are reachable through relays writable by

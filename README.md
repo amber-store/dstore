@@ -10,8 +10,8 @@ for filesystem trees, reachable over [iroh](https://iroh.computer).
 - the view and the **references** (names for tree roots) are CASPaxos
   registers on a small set of voter nodes;
 - nodes join and leave under moderate churn: a view change **rebalances
-  before it is published**, and a cluster-wide **mark-and-sweep** with a
-  probabilistic live set reclaims what no reference reaches.
+  before it is published**, and a cluster-wide **mark-and-sweep** with an
+  exact per-node mark bitmap reclaims what no reference reaches.
 
 > **Status:** design. The architecture is specified in
 > [`architecture/dstore.md`](architecture/dstore.md); there is no code yet.
