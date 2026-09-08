@@ -16,7 +16,8 @@ core `packstore`; the cluster adds three things on top:
   that knows the view and a key knows, without asking anyone, where the
   object is and in what order to try;
 - **a consensus-backed catalog** — the view and the references are
-  CASPaxos registers replicated on a small set of *voter* nodes;
+  CASPaxos registers replicated on the nodes themselves: every node is
+  an acceptor unless it opted out at join;
 - **maintenance that never loses data** — view changes rebalance before
   they are published, and a cluster-wide mark-and-sweep reclaims objects
   no reference reaches.
@@ -60,27 +61,35 @@ Contents:
  │ node A   │   │ node B   │   │ node C   │   │ node D   │   … N nodes
  │ packstore│   │ packstore│   │ packstore│   │ packstore│
  │ meta     │   │ meta     │   │ meta     │   │ meta     │
- │ paxos ●  │   │ paxos ●  │   │ paxos ●  │   │          │   ● = voter
+ │ paxos ●  │   │ paxos ●  │   │ paxos ●  │   │ paxos ●  │   ● = voter (every node, unless --no-vote)
  └──────────┘   └──────────┘   └──────────┘   └──────────┘
         amber-dstore-cluster/1: paxos, gc, transitions, join
 ```
 
 **One process per node, one node per store directory.** A node is a
 single Go binary (`dstore`) that opens `<store>/packstore` (core), a
-`<store>/meta` Pebble DB for its own bookkeeping, and — if it is a voter —
-`<store>/paxos` for acceptor state. Nodes are symmetric: any node answers
+`<store>/meta` Pebble DB for its own bookkeeping, and `<store>/paxos`
+for acceptor state. Nodes are symmetric: any node answers
 any client request, any node can coordinate a reference write or a
 maintenance activity, and there is no leader in the data path.
 
 **Two roles, both per node:** a *data* node holds objects and takes part
 in placement; a *voter* is an acceptor for the catalog. Every node is a
-data node; voters are an explicit, small subset (normally 3 or 5; an even count
-only while a voter is being added or removed; 1 only for a single-node
-cluster) so that ordinary data-node churn never touches consensus
-membership. A node can be
-both. (Rejected: every node a voter — then every reference write waits on a
-majority of the whole cluster and every data-node join is a consensus
-membership change, the one delicate operation in the system.)
+data node and, by default, a voter: the cluster this is designed for has
+three to eight nodes, and at that size a quorum is two to five acceptors,
+a reference write costs one fsync on each, and the catalog tolerates
+`⌊(n−1)/2⌋` failures anywhere — never fewer than the data does. Joining
+and leaving therefore include the acceptor-set change of §5.4, one node
+at a time; a join runs it before the node's data ramp, a removal after
+(or first, for a dead node, so the remaining quorum is among live
+nodes). A node can opt out at join (`--no-vote`) — a relay-only remote
+box, a slow archive machine — and `dstore voter add|remove` change that
+later. An odd count is still better (four voters tolerate no more
+failures than three), so a two-node cluster has no catalog fault
+tolerance, which `cluster status` says. (Rejected: a small explicit
+voter subset, which pays off only when the cluster is far larger than a
+sensible quorum and data-node churn is frequent — at dozens of nodes;
+here it would be a second membership to operate for no gain.)
 
 **Three planes:**
 
@@ -167,8 +176,9 @@ View {
   min_replicas u8       owners that must hold an object before a client
                         proceeds / a reference is accepted (default
                         max(R−1, 2); 1 only with --allow-unsafe)
-  voters       [{id, since}]  acceptors of every register, 1..7, and for
-                        each the epoch of the view that added it (§5.3)
+  voters       [{id, since}]  acceptors of every register — every node
+                        that did not opt out — and for each the epoch of
+                        the view that added it (§5.3)
   voter_sync   enum     done | pending, and the sync's cursor (§5.4)
   nodes        [Node]   the current placement set
   pending      Pending? the target placement set while a transition runs
@@ -360,7 +370,7 @@ whose nodes come and go.
 instance per register, no log, no leader, no snapshotting, and the change
 function is the CAS itself. The trade is that we implement it ourselves
 and that changing the acceptor set is a procedure with a proof obligation
-(§5.4), which is why voters are a small explicit role. (Rejected:
+(§5.4), which is why joins and removals run it one node at a time. (Rejected:
 hashicorp/raft or etcd/raft over an iroh stream layer — mature, but
 leader-based, log+snapshot for what is a KV of tiny independent registers,
 and their membership change is no simpler for us to operate.)
@@ -587,23 +597,25 @@ re-establishes V before the next change:
    that left at one epoch cannot come back two epochs later voting with a
    state that missed a sync.
 
-Replacing a dead voter is add-then-remove: a 3-voter cluster passes
+Replacing a dead node is join-then-remove: a 3-node cluster passes
 through 4 voters with a 3-quorum (the three live ones), never through
-2-of-2. The command refuses a node that is already a voter (a stray `add`
-must not touch a serving acceptor), refuses to proceed unless a majority
-of the *new* voter set answers a ping within 5 s, and refuses to leave
-fewer than 3 voters without `--allow-unsafe`. The one special case is
-the first step out of a single voter: with one acceptor its database *is*
-the committed state, so `cluster init` goes from one voter to three in
-one step — the acceptor stops promising, its rows are copied to the two
-new voters, and one CAS commits the three-voter view — rather than
-through a 2-of-2 configuration that has no fault tolerance and wedges if
-the second voter dies mid-sync. `dstore cluster init --auto-voters 3` waits until two data nodes have
-joined and then promotes both in that one step; after that voter changes
-are operator commands. Voters should keep `<store>/paxos` on a device of its
-own (`--paxos-dir`): a Pebble sync that queues behind packstore's ingest
-fsyncs makes every reference write pay the ingest tail, and a full data
-disk must not be able to stop the catalog.
+2-of-2. The add refuses a node that is already a voter (a stray `add`
+must not touch a serving acceptor) and refuses to proceed unless a
+majority of the *new* voter set answers a ping within 5 s; a removal
+refuses to leave fewer than 3 voters unless the cluster itself has
+fewer than 3 nodes or `--allow-unsafe` is given. The one special case
+is the first step out of a single voter: with one acceptor its database
+*is* the committed state, so the cluster goes from one voter to three in
+one step — the second node to join is admitted as a data node with its
+voter add deferred, and when the third joins the single acceptor stops
+promising, its rows are copied to both, and one CAS commits the
+three-voter view — rather than through a 2-of-2 configuration that has
+no fault tolerance and wedges if the second voter dies mid-sync. (A
+cluster that stays at two nodes runs at 2-of-2 by necessity.) Every node
+should keep `<store>/paxos` on a device of its own (`--paxos-dir`): a
+Pebble sync that queues behind packstore's ingest fsyncs makes every
+reference write pay the ingest tail, and a full data disk must not be
+able to stop the catalog.
 
 *Why one step is safe:* let the old set have `A` voters and the new set
 `A±1`; the quorums are majorities of each, so
@@ -657,7 +669,7 @@ hold it (§5.3).
 ```
 <store>/identity          iroh secret key
 <store>/packstore/        core packstore (segment size by capacity, §13; synced writes)
-<store>/paxos/            acceptor state (voters; created lazily)
+<store>/paxos/            acceptor state (every voter, i.e. every node by default)
 <store>/meta/             Pebble:
    view                    last adopted View
    ballot                  proposer counter
@@ -938,7 +950,12 @@ hostage.
   it lets the sweep drop one; both are ordinary transitions, but
   `replicas` is the one change whose cost is the size of the cluster, so
   the command prints the estimate and asks.
-- **Voters** change through §5.4, independently of placement.
+- **Voters** change as part of join and remove: a join runs the voter
+  add and its sync (§5.4) before the placement ramp; a removal runs the
+  placement transition and then the voter remove — for a dead node the
+  voter remove first, so the remaining quorum is among live nodes. A node
+  joined with `--no-vote` skips the voter steps; `dstore voter add|remove
+  ID` change a node's vote later.
 
 Cluster activities are driven by the holder of `lease/maintenance` (a
 CAS-updated `{holder, expires}`; renewed every lease/3, default 60 s;
@@ -1926,7 +1943,7 @@ node.
 | a majority of voters lost (disks intact) | catalog unavailable; objects still served | `dstore cluster recover` (§13): new incarnation, re-seat the catalog on the survivors, fence the lost voters, hold GC until the salvage is reviewed |
 | a voter's catalog disk lost, node restarted with the same identity | the acceptor answers `amnesiac`, alert | `voter remove` + `voter add` re-syncs it (§5.3) |
 | all voters' catalogs destroyed | references gone, objects intact but unnamed | `dstore catalog restore` from the hourly backup object (§13) |
-| a voter is down | catalog works with a majority; tombstone purge pauses | voter returns, or operator replaces it (§5.4, two steps) |
+| a voter is down | catalog works with a majority; tombstone purge pauses | node returns, or the operator removes it (§8.1) |
 | clock skew on a coordinator | a lease may be judged expired early → two coordinators for a moment; both CAS the same registers, one loses every CAS | keep clocks within seconds; lease is 60 s |
 | corrupt record on disk | CRC/hash fails on read; that owner reports absent; reader tries the next | background reconcile re-copies from a good owner (`replicated=false` after a verify failure) |
 | missing object under a reference | mark aborts with the name and key; nothing swept | operator restores from a backup/pull; `dstore gc why KEY` (§13) |
@@ -1934,12 +1951,13 @@ node.
 ## 13. Operations
 
 ```
-dstore cluster init  --store DIR --replicas 3 [--weight GiB] [--auto-voters 3]   # first node; prints its ticket
+dstore cluster init  --store DIR --replicas 3 [--weight GiB]   # first node; prints its ticket
 dstore serve         --store DIR [--gateway] [--relay URL] [--paxos-dir DIR] [--rate B/s]
 dstore token create                     # a single-use join token
-dstore node join     --store DIR --seed TICKET --token T --weight GiB|auto [--no-ramp]
+dstore node join     --store DIR --seed TICKET --token T --weight GiB|auto [--no-ramp] [--no-vote]
 dstore node remove ID [--dead] | drain ID | weight ID GiB | zone ID Z | repair ID
-dstore voter add ID | remove ID [--allow-unsafe]      dstore cluster replicas R
+dstore voter add ID | remove ID [--allow-unsafe]      # change a node's vote after join
+dstore cluster replicas R
 dstore transition status | abort | refreeze | pause | resume
 dstore gc run [--tolerate-missing] | run --garbage F | status | why KEY   # run waits for the barrier spacing; --garbage re-sweeps only; why: the references that reach KEY
 dstore cluster status | ticket          # status: view, epoch, reachability, disk, transition, gc, voters; ticket: the bootstrap ticket (§5.5)
@@ -2018,15 +2036,16 @@ pending reconcile, pins, catalog round latencies, per-peer reachability.
 Every stall is visible: a transition or an epoch that is waiting names
 the node it waits for.
 
-**Milestones.** M1 — a static cluster: the key index in core, the
-placement package with its golden vectors (shared with core-rs),
-CASPaxos registers over iroh with Pebble acceptors, `cluster init`,
-nodes serving `view`/`missing`/`get`/`put`/`ref-*`, the client library
-with ranked retries, primary-forwarded push and pull, an in-process
-five-node test. M2 — the maintenance lease, transitions with the reconcile pass,
-join/remove/drain/weight. M3 — garbage collection: barriers, pins, the
-owner-partitioned mark, sweeps. M4 — voter changes online, recovery and
-backup, gateway mode, the benchmark. Simulation and the Quint models
+**Milestones.** M1 — a static cluster formed at `cluster init` from a
+fixed list of nodes, all voters: the key index in core, the placement
+package with its golden vectors (shared with core-rs), CASPaxos
+registers over iroh with Pebble acceptors, nodes serving
+`view`/`missing`/`get`/`put`/`ref-*`, the client library with ranked
+retries, primary-forwarded push and pull, an in-process five-node test.
+M2 — the maintenance lease, the voter change with its sync, transitions
+with the reconcile pass, join/remove/drain/weight. M3 — garbage
+collection: barriers, pins, the owner-partitioned mark, sweeps. M4 —
+recovery and backup, gateway mode, the benchmark. Simulation and the Quint models
 (§16) start with M1 and grow with each milestone.
 
 ## 14. Sizing
@@ -2190,7 +2209,9 @@ Everything else — the key format, amberpack records, the reference record,
 
 Choices made here that the reader may want to change:
 
-1. **Voters are an explicit small role**, not every node (§1).
+1. **Every node is a voter by default** (§1): at three to eight nodes a
+   separate voter role is a second membership for no gain; `--no-vote`
+   exists for a node that should hold no catalog.
 2. **Writes are replicated internally**: a client sends each record once
    to a primary owner, which forwards it to the others (§6.2). Clients
    never fan out; the price is one extra LAN hop per record. The primary

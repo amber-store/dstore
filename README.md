@@ -8,7 +8,7 @@ for filesystem trees, reachable over [iroh](https://iroh.computer).
   a consensus-agreed **view** of the cluster, so clients find owners
   without asking anyone and try them in a deterministic order;
 - the view and the **references** (names for tree roots) are CASPaxos
-  registers on a small set of voter nodes;
+  registers replicated on the nodes themselves;
 - nodes join and leave under moderate churn: a view change **rebalances
   before it is published**, and a cluster-wide **mark-and-sweep** with an
   exact per-node mark bitmap reclaims what no reference reaches.
