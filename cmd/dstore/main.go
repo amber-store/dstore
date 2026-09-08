@@ -27,10 +27,14 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
+// version is set at build time (-ldflags "-X main.version=...").
+var version = "dev"
+
 func main() {
 	app := &cli.App{
-		Name:  "dstore",
-		Usage: "a distributed amber store: cluster nodes and the client",
+		Name:    "dstore",
+		Usage:   "a distributed amber store: cluster nodes and the client",
+		Version: version,
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "log-level", Value: "info", Usage: "debug|info|warn|error (a global flag: give it before the command)", EnvVars: []string{"DSTORE_LOG_LEVEL"}},
 		},

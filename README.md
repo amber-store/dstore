@@ -62,6 +62,14 @@ dstore gc run | status | why KEY | hold | release
 dstore catalog backup | backups | restore KEY|FILE
 ```
 
+A container image is published as `ghcr.io/amber-store/dstore:<tag>` by
+the release workflow (`Dockerfile`, entrypoint in `docker/entrypoint.sh`):
+with `DSTORE_ROLE=init` a fresh store creates a cluster and serves, with
+`DSTORE_ROLE=join` plus `DSTORE_SEED` and `DSTORE_TOKEN` it joins one, and
+a store that already belongs to a cluster just serves. The
+[dstore-operator](https://github.com/amber-store/dstore-operator) runs
+it on Kubernetes.
+
 `--no-relay --loopback` run everything on one machine without relays;
 `DSTORE_TICKET` and `DSTORE_STORE` stand in for the flags. Every node
 keeps its UDP port in `<store>/port` so that tickets stay valid across
