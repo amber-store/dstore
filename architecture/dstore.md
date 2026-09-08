@@ -86,15 +86,17 @@ membership change, the one delicate operation in the system.)
 
 | plane | carries | consistency | mechanism |
 |---|---|---|---|
-| data | objects | content-addressed, idempotent, verified at every hop | packstore + placement + fan-out |
+| data | objects | content-addressed, idempotent, verified at every hop | packstore + placement + primary-forwarded replication |
 | catalog | view, references, leases, GC state | linearizable per register (CAS) | CASPaxos on the voters |
 | maintenance | rebalancing, repair, GC | eventually complete, resumable, never destructive before it is safe | per-pack reconcile pass; epoch-numbered GC cycles |
 
 **Who computes what.** Clients build trees (chunk, hash, encode) exactly as
 the amber CLI does today and talk to owners directly: they fetch the view,
-compute owners per key, negotiate what is missing, and upload only that.
-Nodes verify every object against its key before storing it, serve reads
-from their packstore, run the paxos acceptor, and run maintenance. A
+compute owners per key, and send each record once, to one of its owners,
+which stores it and replicates it to the others (§6.2). Nodes verify
+every object against its key before storing it, replicate what they
+receive, serve reads from their packstore, run the paxos acceptor, and
+run maintenance. A
 reference write is the one operation a node coordinates on the client's
 behalf: its completeness walk is many small round trips to owners, which
 belong on the LAN next to the stores (§7), and a client behind a relay
@@ -675,60 +677,101 @@ hold it (§5.3).
 
 ### 6.2 Writes
 
-The party that has the objects — the client library, or a gateway node on a
-client's behalf — is the fan-out agent. For a set of keys it:
+A client sends each record **once**, to a *primary*: the owner of the
+key, under `nodes` in its cached view, with the best path from the
+client — a direct connection before a relayed one, then the lowest
+measured round-trip time, then rank order (§11.1). The primary stores
+the record and replicates it to the key's other owners. Clients
+never fan out — a build runner or a remote user uploads each byte once,
+and the LAN does the rest. For a set of keys the client library (or a
+gateway node on a legacy client's behalf):
 
-1. computes the write set per key under its cached view (§4);
-2. groups keys by owner and sends each owner `missing {epoch, keys, pin}`
-   (32 B per key; the reply is the subset that owner lacks);
-3. uploads the missing records to each owner as byte-balanced amberpack
+1. computes each key's owners under its cached view (§4), picks the
+   primary among them by its path measurements (§11.1), and groups keys
+   by primary;
+2. sends each primary `missing {epoch, keys, pin}` (32 B per key). The
+   reply names the keys the primary itself lacks and, for the keys it
+   holds, which owners hold each (`short [{key, holders[]}]` for those
+   below `R`) — the primary negotiates them with the other owners before
+   answering, key lists only, bounded by `(R−1) × 32 B` per key;
+3. uploads those records to the primary as byte-balanced amberpack
    batches (target 60 MiB, ≤ 8192 keys) over `put {epoch}`, in parallel
-   across owners and, for throughput, across sharded connections
-   (§11.3); records travel verbatim from the sender's packstore
-   (`GetRecord`) — no re-encoding;
-4. reads each owner's per-batch reply: `stored`, `deduped`, `rejected[]`
-   (hash mismatch, malformed — the node verifies each record itself and
-   skips a bad one rather than aborting the batch), `no-space`, or `busy`
-   with a jittered retry hint (a node admits a bounded number of
-   concurrent write streams, default 2× cores, and a byte budget; excess
+   across primaries — a tree's keys have primaries spread over the whole
+   cluster, so a LAN client still talks to many nodes at once — and, for
+   throughput, across sharded connections (§11.3); records travel
+   verbatim from the sender's packstore (`GetRecord`), no re-encoding;
+4. reads each batch's reply: per key, the owners that now hold it
+   (`holders[]`) and any owner that did not (`failed [{node, reason,
+   retry_after?}]`, a replica's `busy` or `stale-view` relayed as such),
+   plus `rejected[]` (hash mismatch, malformed — the node verifies each
+   record itself and skips a bad one rather than aborting the batch),
+   `no-space`, or `busy` with a jittered retry hint (a node admits a
+   bounded number of concurrent write streams, default 2× cores, and a
+   byte budget, with a share reserved for cluster-ALPN writes — forwards
+   and reconcile — so client streams cannot starve replication; excess
    streams are simply not read until a slot frees, QUIC flow control
    holding the sender back);
-5. counts, per key, the owners that confirmed it (stored, deduped, or
-   "not missing" at step 2) and reports the count. An owner that keeps
-   answering `busy` past `busy_deadline` (default 5 min) counts as
-   unreachable for the ack policy below, so a stalled node fails a push
-   with its name rather than hanging it.
+5. applies the ack policy below to the holders. Any owner — primary or
+   replica — that keeps answering `busy` past `busy_deadline` (default
+   5 min) counts as unreachable; a key short at a replica is re-put to
+   the primary (which re-forwards; dedup makes it cheap) or, if the
+   primary's forwards keep failing, sent by the client to the lacking
+   owner directly — any owner accepts a client `put` for a key it owns,
+   the primary is a preference, not a role. The push fails naming the
+   owners that did not confirm only when no owner will take a key.
 
-A node accepts a `put` only if its epoch matches, the key is one it owns
-under `nodes ∪ pending.nodes` (else `not-owner`, with the view), and it
-has space; it verifies every payload
-against its key (`WriteParallel`, the same gate core's daemon uses) and
-answers only after the batch is durable (synced append).
+**What the primary does.** On a client-ALPN `missing`, besides
+answering what it lacks, it negotiates the keys it *holds* with the
+key's other owners under `nodes ∪ pending.nodes` — synchronously, key
+lists only, `pin` set if the client set it, so dedup hits are pinned at
+every owner just as if the client had asked, and the reply reports which
+owners confirmed each key — and *queues* its own copy for forwarding
+wherever one is lacking: the reconcile pass's first audit (§8.4) run on
+demand, asynchronous, deduplicated per key and under `--rate`, so
+"present at the primary" becomes "present at every owner" within
+seconds without the client's involvement and without the reply waiting
+for bytes. Only the client ALPN triggers this; a `missing` on the
+cluster ALPN — the reference gate's, the reconcile pass's — is a plain
+presence check, so audits never cascade node to node, and a client is
+rate-limited in the audits it can trigger as it is in `ref-list`. On `put`, it accepts a record only if its epoch matches and
+the key is one it owns under `nodes ∪ pending.nodes` (else `not-owner`,
+with the view) and it has space; it verifies the payload against the key
+(`WriteParallel`, the same gate core's daemon uses), appends it durably,
+forwards it to the other owners over the cluster ALPN (`missing` then
+`put` there; a replica applies the same verification and pins dedup hits
+the same way), and answers the batch with each key's holders once its own
+append is synced and every forward has been confirmed or failed.
+Forwarding is synchronous and bounded: per-target queues are small, the
+forward timeout (seconds) is far below the client's batch deadline so
+one slow replica cannot convoy every primary's batches, a replica that
+does not answer in time fails the key *for this batch* and the reply
+says which and why (`busy` with its hint, `stale-view` — after which
+the primary adopts the newer view and relays it to the client); the
+primary keeps no state about in-flight replication, and a record that
+reached it but not every replica is in the same position as after any
+partial write — healed by the reconcile pass (§8.4), which the primary
+also schedules at once for the keys the batch left short. Records arrive at replicas in young segments and pin
+nothing; a dedup hit at a replica pins there (§9.5).
 
-**Forward mode.** A `put {forward: true, targets}` asks the receiving
-owner to replicate on the sender's behalf: it stores what it owns,
-forwards each record to the owners the sender named as lacking it
-(under `nodes ∪ pending.nodes`) over the cluster ALPN, and reports
-per-key replica counts. The client still negotiates `missing` with every
-owner — key lists are cheap — and sends each record once, to the
-highest-ranked reachable owner, so a retried push after a partial failure
-re-sends exactly what is still missing somewhere rather than trusting
-"present at one owner". The client library uses it when its own path to the
-cluster is relayed (a remote user's uplink is the bottleneck) and direct
-fan-out when it is on the LAN, where parallel owner-direct uploads and
-honest per-owner acks are worth more than the saved bytes. Forwarding is
-synchronous — the node keeps no state about in-flight replication — and
-a record that reached the receiving owner but not the others is in the
-same position as after any partial direct write: healed by the reconcile
-pass (§8.4). (Rejected: forward-only — one node's ingest becomes the
-bottleneck for LAN build runners; direct-only — R-fold upload over relays.)
+Every node is a primary for some keys, so the extra hop costs one LAN
+round trip per batch and a second copy of every byte on the LAN, not a
+bottleneck; the owner nearest to every client takes at most `R` times
+its share of first-hop traffic, and the forwards still spread the bytes.
+In a cluster spanning sites this keeps a client's uploads at its own
+site, with the cross-site copies made by the primary. (Rejected: clients writing to every owner themselves —
+`R`-fold upload and `R`-fold connections from every client, including
+relayed ones, for the sake of per-owner acks that the primary's per-key
+counts give anyway. Rejected: a designated per-node ingest proxy — the
+primary is chosen per key, so no node becomes a funnel.)
 
-**Ack policy.** A key is *placed* when ≥ `min_replicas` owners of
-`nodes` confirmed it and, during a transition, also ≥ `min_replicas`
-owners of `pending.nodes`. A client that cannot place a key (owners down,
-`no-space`, `busy` past its deadline) fails the operation and reports
-which owners it could not reach; it does not silently accept fewer
-replicas. Missing replicas of a placed key are healed by the reconcile
+**Ack policy.** A key is *placed* when its reported holders include ≥
+`min_replicas` owners of `nodes` and, during a transition, also ≥
+`min_replicas` owners of `pending.nodes` — the holders come from the
+`put` reply for keys the client uploaded and from the `missing` reply's
+`short` list for keys it did not, so a dedup hit is covered too. A client
+whose key comes back short retries as step 5 says and then fails the
+operation naming the owners that did not confirm; it does not silently
+accept fewer replicas. Missing replicas of a placed key are healed by the reconcile
 pass (§8.4) within its first-audit window (minutes), which is why
 `min_replicas = R−1` is the default — the object is on `R−1` nodes now
 and on `R` shortly — but never below 2: at `R = 2` the default is 2, and
@@ -740,7 +783,8 @@ and on `R` shortly — but never below 2: at `R = 2` the default is 2, and
 `get {epoch, keys}` asks one node for a batch of objects; it answers
 `absent[]` first (existence checked before streaming, the project
 convention) and then the present records as an amberpack. Readers group
-keys by first-ranked owner, fetch, verify each payload against its key
+keys by their preferred owner (the ranking as a hint, refined by the
+client's path measurements, §11.1), fetch, verify each payload against its key
 (peers are not trusted with content — a corrupt disk is enough), and
 re-ask the next-ranked owner for what came back absent or failed, down
 the read order of §4. A key is *not found* only when every owner in the read order — under
@@ -756,8 +800,9 @@ deterministic, the *order* is a hint) keeps a dead node from stalling
 every batch.
 
 `missing` is the same primitive without the bytes and serves both the
-writer's negotiation and the reference gate; `pin: true` makes it an
-atomic has-and-pin (§9.5). A key the node holds only as a record it has
+writer's negotiation (client ALPN, where it also reports the other
+owners' holdings, §6.2) and the reference gate (cluster ALPN, a plain
+check); `pin: true` makes it an atomic has-and-pin (§9.5). A key the node holds only as a record it has
 found corrupt (§8.4) is answered *missing*, so a good copy is sent and
 not deduplicated away. It answers *present* only for records that
 are durable: a hit in the active segment beyond its last synced offset
@@ -937,7 +982,7 @@ A data node that learns an epoch with a new `pending` (or a new `nodes`):
    `id`"; the field is a set of node IDs.
 
 From this instant every object the node accepts arrives with the new
-epoch and was placed by a writer that computed the union write set (§6.2).
+epoch and is replicated by its primary under the union write set (§6.2).
 Everything it accepted before — including writes accepted at the old
 epoch from clients that had not yet seen the change — sits in packs with
 id ≤ `seal`, and those are what the pass below forwards first; §8.5 says
@@ -1058,7 +1103,9 @@ count for the second.)
   sealing, default 5 min — this is what heals a write whose owner was down
   at the time), and packs whose `checked` is older than `audit_interval`
   (default 7 days) — one pack at a time per node, rate-limited
-  (`--rate`), so it never competes with client traffic. The first audit
+  (`--rate`), so it never competes with client traffic; a primary that
+  left a key short, or found one under-replicated while negotiating for
+  a client (§6.2), schedules that key's audit at once. The first audit
   covers the **active segment** too — its index is in RAM and packstore
   can enumerate it (§15) — so a record written at `min_replicas` is
   offered to its missing owner within `first_audit` of landing, however
@@ -1163,7 +1210,7 @@ placement_epoch = pending.id; pending = null`, new epoch.
 **Rebalancing is achieved** means: every object that existed on a
 participant before it adopted the transition has been offered to every
 target owner, and every object written since was placed on the target
-owners by its writer. What can still be missing after the commit are the
+owners by its primary, as far as they confirmed. What can still be missing after the commit are the
 same gaps normal operation leaves — an object a writer could not place on
 a down owner — and the background pass closes them.
 
@@ -1530,8 +1577,10 @@ finds it absent and answers `incomplete` — only a wasted upload. An
 upload that runs longer than two `gc_interval`s therefore refreshes:
 the client library re-negotiates every uploaded key with
 `missing {pin: true}` at least once per `gc_interval/2` (key lists
-only), which pins the keys that have meanwhile left the exempt region
-(§11.4). Records from uploads that never get a reference (a client
+only), which pins the keys that have meanwhile left the exempt region at
+the primary and, through its relay, at the replicas — and the reply says
+which owners confirmed, so a replica the relay could not reach is pinned
+by the client directly (§11.4). Records from uploads that never get a reference (a client
 crashed) become garbage after two more acked barriers unless something
 else reaches them.
 
@@ -1701,9 +1750,9 @@ Every request carries the sender's `epoch`.
 | op | request | reply |
 |---|---|---|
 | `view` | — | `view {View, unreachable[]}` (members this node cannot currently reach) |
-| `missing` | `{epoch, keys[], pin bool}` | `missing {keys[]}` |
+| `missing` | `{epoch, keys[], pin bool}` | `missing {lacking[], short[{key, holders[]}]}` — `short` only on the client ALPN (§6.2) |
 | `get` | `{epoch, keys[]}` | `absent {keys[]}` then `data…data-end` (verbatim records) |
-| `put` | `{epoch, forward?, targets?}` then `data…data-end` | `put-result {stored, deduped, rejected[{key, reason}], replicas?[{key, n}]}` |
+| `put` | `{epoch}` then `data…data-end` | `put-result {rejected[{key, reason}], holders[{key, nodes[]}], failed[{key, node, reason, retry_after?}]}` — on the client ALPN the receiver replicates to the other owners; on the cluster ALPN it stores only |
 | `ref-get` | `{name}` | `ref {record, version}` \| `unknown-ref` |
 | `ref-put` | `{record, expected_version? \| expected_old?}` | `ok {key, version}` \| `cas-mismatch {current?, version}` \| `incomplete {keys[], shortfall}` |
 | `ref-delete` | `{name, expected_version? \| expected_old?}` | `ok` \| `cas-mismatch {current?, version}` |
@@ -1762,12 +1811,30 @@ most `R` times per key before surfacing the error). `Owners(key)`,
 `WriteSet(key)`, `ReadOrder(key)` are the §4 functions over the cached
 view.
 
+**Owner preference by probing.** Placement says *which* nodes hold a
+key; the client decides which of them to talk to first by measuring its
+paths. For every node it has a connection to, the pool records the
+connection's current path — direct or relayed, which go-iroh reports
+and updates as hole punching lands — and its smoothed round-trip time
+from QUIC's own estimate; a node the client has never dialed is dialed
+when rank order first puts it ahead of a measured one, so measurements
+fill in on first use and no probing traffic is spent on nodes the client
+never needs. `Primary(key)` orders a key's owners under `nodes` by: a
+direct path before a relayed one, then lowest round-trip time, then rank
+— so the write goes to the nearest owner and the LAN, not the client's
+uplink, carries the replication. Reads use the same preference to choose
+which owner to ask first (§6.3 treats the ranking as a hint), and fall
+down the ranking exactly as before. Measurements age out after a minute
+without traffic and are re-taken; a path that changes (a punch lands, a
+relay takes over) re-orders the next batch, never one in flight.
+
 ### 11.2 Objects
 
 - `Missing(keys) map[NodeID][]Key` and `Put(objects) (per-key replica
-  count, per-node errors)` implement §6.2 with byte-balanced batches per
-  owner and parallel workers per node (`Jobs`, default GOMAXPROCS).
-- `Get(keys) iter` implements §6.3: group by first-ranked owner, verify,
+  count, per-node errors)` implement §6.2: keys grouped by primary,
+  byte-balanced batches per primary, parallel workers per node (`Jobs`,
+  default GOMAXPROCS), each record sent once.
+- `Get(keys) iter` implements §6.3: group by the preferred owner (§11.1), verify,
   re-ask down the read order, per-node backoff (`5 s` after a failure,
   exponential to `60 s`).
 
@@ -1790,19 +1857,22 @@ timeout per process.
 ### 11.4 Tree push
 
 `Push(root, name, expectedVersion | expectedOld | force)`: walk the local packstore's tree
-(`fstree.ReachableKeys`), `Missing` per owner with `pin: true`, `Put`
-what is missing, check every key placed (§6.2 ack policy), then
-`ref-put` through any node. A push that runs longer than
+(`fstree.ReachableKeys`), `Missing` per primary with `pin: true`, `Put`
+what is missing to the primaries, check every key placed (§6.2 ack
+policy), then `ref-put` through any node. A push that runs longer than
 `gc_interval/2` re-negotiates every key uploaded so far with
 `Missing {pin: true}` at that interval (key lists only, a few MB per
-million keys) so that a multi-hour upload never outlives the protection
-of its early objects (§9.5). A key that cannot be placed fails the push
+million keys), pinning any owner the reply shows unconfirmed directly,
+so that a multi-hour upload never outlives the protection of its early
+objects (§9.5). A key that cannot be placed fails the push
 with the unreachable owners named; a `cas-mismatch` surfaces with the
 current key (the CLI suggests `pull` or `--force`); an `incomplete` —
 possible if GC reaped a dedup-hit object between the negotiation and the
-gate — re-runs the whole negotiation (the cheap part) and re-uploads
-whatever is missing anywhere, then retries; it never trusts the sample of
-keys the error names to be the whole gap.
+gate — re-runs the whole negotiation (the cheap part; its `short` list
+now names every owner that lacks a key), sends what is missing anywhere
+to an owner that lacks it, and retries; it never trusts the sample of
+keys the error names to be the whole gap, and after two such rounds it
+fails naming the owners still short rather than loop.
 
 ### 11.5 Tree pull
 
@@ -1819,8 +1889,8 @@ is written.
 `dstore serve --gateway` additionally registers the transport-iroh ALPN
 `amber-store-iroh/1` and serves its push/pull/ref-list/pin operations by
 routing through the client library: the server-driven want loop computes
-wants with cluster-wide `Missing`, received objects are fanned out with
-`Put`, and the final commit is a `ref-put`. Existing clients — jobs-iroh's
+wants with cluster-wide `Missing`, received objects go to their
+primaries with `Put`, and the final commit is a `ref-put`. Existing clients — jobs-iroh's
 `amberclient`, the `amber` CLI — then work unchanged against a cluster.
 Records fetched for a pull round are staged in a small local packstore
 (`<store>/gwcache`, size-capped, entries dropped after an hour) so the
@@ -1838,11 +1908,11 @@ node.
 
 | scenario | what happens | what heals it |
 |---|---|---|
-| node crashes and restarts, no view change | reads fall through to the next owner; writes place on the other owners (`min_replicas`) and report the gap | the node's own and its peers' background reconcile (`replicated = false` packs) |
+| node crashes and restarts, no view change | reads fall through to the next owner; writers take their next-preferred owner as primary, which places on the others (`min_replicas`) and names the owner it could not reach | the node's own and its peers' background reconcile (`replicated = false` packs) |
 | node lost for good | as above until the operator removes it | transition: surviving owners forward its share to the new owners (§8) |
 | node joins | transition; clients dual-place until commit | — |
 | client crashes mid-upload | orphan objects, exempt from two sweeps (§9.5) | GC |
-| client crashes between upload and `ref-put` | as above | GC; a retry re-negotiates (mostly dedup) and pins again |
+| client crashes between upload and `ref-put` | as above | GC; a retry re-negotiates (mostly dedup) and pins again at every owner the reply confirms |
 | reference PUT races a sweep | pins (§9.5) or a clean `incomplete` | client re-negotiates and re-uploads what is missing |
 | two clients CAS the same reference | one wins; the other gets `cas-mismatch{current}` | — |
 | network partition | minority side: catalog operations `unavailable`; objects still readable/writable where owners are reachable; placement unchanged | reconnect; objects are idempotent, catalog needs nothing; nodes the majority removed meanwhile hand their data back as ex-members (§8.4) |
@@ -1952,8 +2022,8 @@ the node it waits for.
 placement package with its golden vectors (shared with core-rs),
 CASPaxos registers over iroh with Pebble acceptors, `cluster init`,
 nodes serving `view`/`missing`/`get`/`put`/`ref-*`, the client library
-with ranked retries and fan-out push and pull, an in-process five-node
-test. M2 — the maintenance lease, transitions with the reconcile pass,
+with ranked retries, primary-forwarded push and pull, an in-process
+five-node test. M2 — the maintenance lease, transitions with the reconcile pass,
 join/remove/drain/weight. M3 — garbage collection: barriers, pins, the
 owner-partitioned mark, sweeps. M4 — voter changes online, recovery and
 backup, gateway mode, the benchmark. Simulation and the Quint models
@@ -2121,9 +2191,11 @@ Everything else — the key format, amberpack records, the reference record,
 Choices made here that the reader may want to change:
 
 1. **Voters are an explicit small role**, not every node (§1).
-2. **Clients fan out writes directly on the LAN**; forward mode, where
-   one owner replicates on the client's behalf, exists for relayed
-   clients and gateways (§6.2).
+2. **Writes are replicated internally**: a client sends each record once
+   to a primary owner, which forwards it to the others (§6.2). Clients
+   never fan out; the price is one extra LAN hop per record. The primary
+   is the owner with the best measured path from the client — direct
+   before relayed, then lowest round-trip time (§11.1).
 3. **`min_replicas` defaults to `max(R−1, 2)`**: writes and reference
    PUTs proceed with one owner down at `R ≥ 3`; at `R = 2` they wait for
    both owners unless the operator allows a single copy (§6.2).
@@ -2142,10 +2214,8 @@ Choices made here that the reader may want to change:
    should set the allowlist.
 8. **Placement is per 2^20 hash slot**, a protocol constant; keys in a
    slot share owners (§4).
-9. **Forward-mode puts are chosen by the client from its path** (relayed
-   → forward, direct → fan-out) rather than by configuration (§6.2).
-10. **Reference records carry a version** for CAS; key-based CAS is kept
-    for transport-iroh-shaped clients (§7).
-11. **The view lists members, not live nodes**; reachability is
+9. **Reference records carry a version** for CAS; key-based CAS is kept
+   for transport-iroh-shaped clients (§7).
+10. **The view lists members, not live nodes**; reachability is
     advisory and removal is manual (§3, §17).
-12. Module path `github.com/amber-store/dstore`, one binary `dstore`.
+11. Module path `github.com/amber-store/dstore`, one binary `dstore`.
