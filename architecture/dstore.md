@@ -1865,7 +1865,10 @@ the connection or of client sockets feeding it, and a second receiving
 endpoint adds roughly half again before the machine saturates. So bulk
 transfers open extra connections to a node's data endpoints (§3), each
 its own socket, exactly as transport-iroh's sharded transfers do, but
-without tokens: every `put`/`get` stream is
+without tokens; and every endpoint, node or client, configures its QUIC
+flow-control windows for the bandwidth-delay product of a WAN path
+(§16), since the library defaults cap a single stream at a few tens of
+MB/s across 40 ms: every `put`/`get` stream is
 independent, so the pool simply holds `Conns` (default 4) connections per
 node and deals batches across them. Per-node pools grow under load and
 shrink after ~90 s idle, as jobs-iroh's `amberclient` does; the total
@@ -2192,9 +2195,16 @@ Everything else — the key format, amberpack records, the reference record,
   socket count on the sending side, with a second receiving endpoint
   adding about half; Linux with GSO/GRO should do better, and the number
   of data endpoints per node (§3) is sized from that measurement — the
-  transport stays iroh. Second, `missing` of 32 k absent keys against a
-  node with 25 k packs after the key index lands (target: under a
-  second).
+  transport stays iroh. Across a WAN (same day, a Hetzner box with a
+  1 Gbit NIC against a Linux node on a home LAN, 43 ms RTT, direct
+  addresses) both stacks reach the NIC's line rate, ~107 MB/s on one
+  stream — go-iroh out of the box and Rust iroh only once its QUIC
+  windows are raised (the quinn defaults, a 1.25 MB stream window, cap
+  one stream at ~27 MB/s at that RTT), so a dstore node and client set
+  `stream_receive_window`, `receive_window` and `send_window` from the
+  bandwidth-delay product they are meant to carry, tens of MiB for a
+  1 Gbit WAN. Second, `missing` of 32 k absent keys against a node with
+  25 k packs after the key index lands (target: under a second).
 
 ## 17. Non-goals and later work
 
