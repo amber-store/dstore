@@ -1857,10 +1857,15 @@ relay takes over) re-orders the next batch, never one in flight.
 
 ### 11.3 Throughput
 
-One go-iroh socket loop caps well below a fast link (~16 MB/s loopback in
-transport-iroh's measurements), so bulk transfers open extra connections
-on separate endpoints/sockets to the same node, exactly as transport-iroh's
-sharded transfers do, but without tokens: every `put`/`get` stream is
+One iroh endpoint tops out well below a fast link: measured on the
+reference Mac over loopback with both ends on the machine (2026-09-08),
+a single endpoint receives about 300 MB/s with Rust iroh 1.1.0 and
+350–380 MB/s with go-iroh 0.2.0, whatever the number of streams sharing
+the connection or of client sockets feeding it, and a second receiving
+endpoint adds roughly half again before the machine saturates. So bulk
+transfers open extra connections to a node's data endpoints (§3), each
+its own socket, exactly as transport-iroh's sharded transfers do, but
+without tokens: every `put`/`get` stream is
 independent, so the pool simply holds `Conns` (default 4) connections per
 node and deals batches across them. Per-node pools grow under load and
 shrink after ~90 s idle, as jobs-iroh's `amberclient` does; the total
@@ -2179,12 +2184,17 @@ Everything else — the key format, amberpack records, the reference record,
   local multi-node cluster through ingest → delete → transition → GC and
   reports the same tables.
 - **Two measurements before the protocol is built**, because the cost
-  model depends on them: go-iroh's per-endpoint throughput on a 10 GbE
-  link (transport-iroh measured ~16 MB/s per socket on loopback; if that
-  holds on real links the data plane needs many data endpoints per node,
-  which the view already provides for — the transport stays iroh), and
-  `missing` of 32 k absent keys against a node with 25 k packs after the
-  key index lands (target: under a second).
+  model depends on them. First, iroh's per-endpoint throughput on the
+  target Linux hardware over a 10 GbE link: on the reference Mac over
+  loopback (2026-09-08, both ends on one machine, macOS without UDP
+  segmentation offload) one endpoint receives ~300 MB/s with Rust iroh
+  1.1.0 and ~350–380 MB/s with go-iroh 0.2.0, independent of stream and
+  socket count on the sending side, with a second receiving endpoint
+  adding about half; Linux with GSO/GRO should do better, and the number
+  of data endpoints per node (§3) is sized from that measurement — the
+  transport stays iroh. Second, `missing` of 32 k absent keys against a
+  node with 25 k packs after the key index lands (target: under a
+  second).
 
 ## 17. Non-goals and later work
 
