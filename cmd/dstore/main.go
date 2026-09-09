@@ -101,6 +101,7 @@ func nodeFlags() []cli.Flag {
 		&cli.Int64Flag{Name: "rate", Usage: "reconcile copy rate in bytes/s (0 = unlimited)"},
 		&cli.IntFlag{Name: "jobs", Usage: "parallelism (0 = cores)"},
 		&cli.Int64Flag{Name: "min-free", Usage: "free bytes below which uploads are refused (0 = 5% or 100 GiB)"},
+		&cli.StringFlag{Name: "pack-size", Value: defaultPackSize, Usage: "size at which the active pack is sealed (bytes or Ki/Mi/Gi/Ti); applies to packs written from now on", EnvVars: []string{"DSTORE_PACK_SIZE"}},
 		&cli.BoolFlag{Name: "gateway", Usage: "also serve the transport-iroh ALPN (not implemented in this version)"},
 		&cli.DurationFlag{Name: "gc-interval", Value: 4 * time.Hour},
 		&cli.DurationFlag{Name: "put-ttl", Value: time.Hour},
@@ -192,10 +193,34 @@ func bindNodeEndpoint(ctx context.Context, c *cli.Context, dir string) (*transpo
 	return ep, nil
 }
 
+// defaultPackSize is the --pack-size default, node.DefaultSegmentSize.
+const defaultPackSize = "2Gi"
+
+// packSize reads --pack-size. An empty value (an exported but empty
+// $DSTORE_PACK_SIZE) means the default.
+func packSize(c *cli.Context) (int64, error) {
+	v := strings.TrimSpace(c.String("pack-size"))
+	if v == "" {
+		v = defaultPackSize
+	}
+	n, err := parseSize(v)
+	if err != nil {
+		return 0, fmt.Errorf("--pack-size: %w", err)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("--pack-size: %d is not a positive size", n)
+	}
+	return n, nil
+}
+
 func openNode(ctx context.Context, c *cli.Context) (*node.Node, error) {
 	dir := c.String("store")
 	if dir == "" {
 		return nil, errors.New("no store directory: set --store or $DSTORE_STORE")
+	}
+	segSize, err := packSize(c)
+	if err != nil {
+		return nil, err
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
@@ -207,7 +232,7 @@ func openNode(ctx context.Context, c *cli.Context) (*node.Node, error) {
 	cfg := node.Config{
 		StoreDir: dir, PaxosDir: c.String("paxos-dir"), Endpoint: ep, Logger: logger(c),
 		Jobs: c.Int("jobs"), Rate: c.Int64("rate"), MinFree: c.Int64("min-free"), Gateway: c.Bool("gateway"),
-		GCInterval: c.Duration("gc-interval"), PutTTL: c.Duration("put-ttl"),
+		GCInterval: c.Duration("gc-interval"), PutTTL: c.Duration("put-ttl"), SegmentSize: segSize,
 	}
 	n, err := node.Open(cfg)
 	if err != nil {

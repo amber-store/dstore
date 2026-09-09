@@ -6,8 +6,8 @@ require (
 	charm.land/bubbles/v2 v2.2.1
 	charm.land/bubbletea/v2 v2.0.9
 	charm.land/lipgloss/v2 v2.0.6
-	github.com/amber-store/core v0.0.6
-	github.com/amber-store/transport-iroh v0.3.0
+	github.com/amber-store/core v0.0.7
+	github.com/amber-store/transport-iroh v0.4.0
 	github.com/cockroachdb/pebble/v2 v2.1.7
 	github.com/fxamacker/cbor/v2 v2.9.3
 	github.com/tmc/go-iroh v0.2.0

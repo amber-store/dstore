@@ -67,8 +67,8 @@ the release workflow (`Dockerfile`, entrypoint in `docker/entrypoint.sh`):
 with `DSTORE_ROLE=init` a fresh store creates a cluster and serves, with
 `DSTORE_ROLE=join` plus `DSTORE_SEED` and `DSTORE_TOKEN` it joins one, and
 a store that already belongs to a cluster just serves. `DSTORE_PORT`,
-`DSTORE_ADVERTISE`, `DSTORE_PAXOS_DIR`, `DSTORE_GC_INTERVAL` and
-`DSTORE_EXTRA_ARGS` map onto the matching flags. Relays follow the CLI
+`DSTORE_ADVERTISE`, `DSTORE_PAXOS_DIR`, `DSTORE_GC_INTERVAL`,
+`DSTORE_PACK_SIZE` and `DSTORE_EXTRA_ARGS` map onto the matching flags. Relays follow the CLI
 default (the built-in relay map) so that the ticket carries a relay URL
 and clients outside the network can reach the nodes; `DSTORE_RELAY=<url>`
 selects a relay and `DSTORE_NO_RELAY=1` disables relays. Note that a
