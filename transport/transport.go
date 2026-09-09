@@ -27,7 +27,7 @@ type Stream interface {
 // PathInfo describes a connection's current path.
 type PathInfo struct {
 	Direct bool
-	RTT    time.Duration
+	RTT    time.Duration // 0 until the path has a measurement
 }
 
 // Conn is an authenticated connection to a peer.

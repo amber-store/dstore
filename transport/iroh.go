@@ -289,6 +289,10 @@ func (c *irohConn) AcceptStream(ctx context.Context) (Stream, error) {
 	return s, nil
 }
 func (c *irohConn) Close() error { return c.c.Close() }
+
+// Path reports the selected path. Its RTT stays 0 until the path has a
+// measurement: the connection-level smoothed RTT is the initial guess
+// (100 ms) after a path migration, which would rank a LAN node as far.
 func (c *irohConn) Path() PathInfo {
 	info := PathInfo{Direct: true}
 	for _, p := range c.c.Paths() {
@@ -298,9 +302,6 @@ func (c *irohConn) Path() PathInfo {
 				info.RTT = p.RTT
 			}
 		}
-	}
-	if info.RTT == 0 {
-		info.RTT = c.c.Stats().SmoothedRTT
 	}
 	return info
 }

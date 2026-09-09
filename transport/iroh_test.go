@@ -204,3 +204,69 @@ func deadLoopbackAddr(t *testing.T) string {
 	pc.Close()
 	return addr
 }
+
+// TestIrohPathRTTIsUnknownUntilSampled checks that a fresh connection does
+// not report QUIC's initial round-trip guess as a measurement: the client
+// ranks owners by it, and a guess of 100 ms would put a LAN node in the
+// far class.
+func TestIrohPathRTTIsUnknownUntilSampled(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	bind := func(alpns ...string) *IrohEndpoint {
+		sk, err := irohkey.GenerateSecretKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ep, err := BindIroh(ctx, IrohConfig{SecretKey: sk, ALPNs: alpns, Loopback: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { ep.Close() })
+		return ep
+	}
+	server := bind(wire.ALPNClient)
+	client := bind()
+	go func() {
+		c, err := server.Accept(ctx)
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		s, err := c.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		if _, err := wire.ReadMsg(s); err == nil {
+			_ = wire.WriteMsg(s, &wire.Msg{Type: wire.TPong})
+		}
+		wire.CloseStream(s)
+		<-ctx.Done()
+	}()
+	conn, err := client.Dial(ctx, server.ID(), server.Addrs(), wire.ALPNClient)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	check := func(when string) {
+		t.Helper()
+		ic := conn.(*irohConn)
+		t.Logf("%s: path %+v stats min=%v latest=%v smoothed=%v paths=%+v", when, conn.Path(), ic.c.Stats().MinRTT, ic.c.Stats().LatestRTT, ic.c.Stats().SmoothedRTT, ic.c.Paths())
+		if p := conn.Path(); p.RTT != 0 && p.RTT >= 50*time.Millisecond {
+			t.Fatalf("%s: a loopback connection reports an RTT of %v: the initial guess, not a sample", when, p.RTT)
+		}
+	}
+	check("after dial")
+	s, err := conn.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wire.WriteMsg(s, &wire.Msg{Type: wire.TPing}); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.CloseWrite()
+	if _, err := wire.ReadMsg(s); err != nil {
+		t.Fatal(err)
+	}
+	wire.CloseStream(s)
+	check("after one exchange")
+}
