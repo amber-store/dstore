@@ -668,7 +668,7 @@ hold it (§5.3).
 
 ```
 <store>/identity          iroh secret key
-<store>/packstore/        core packstore (segment size by capacity, §13; synced writes)
+<store>/packstore/        core packstore (2 GiB packs by default, `--pack-size`, §13; synced writes)
 <store>/paxos/            acceptor state (every voter, i.e. every node by default)
 <store>/meta/             Pebble:
    view                    last adopted View
@@ -2033,8 +2033,8 @@ so an *absent* key, which is what most of a push negotiation and every
 reconcile offer consists of, costs one probe per pack: ~0.5 ms per key
 on a 10 TiB node, seconds per 8192-key `missing`. dstore therefore
 requires packstore's node-level key index (§15) from the first version,
-chooses the segment size from capacity (256 MiB below 4 TiB, 1 GiB
-below 16 TiB, 4 GiB above, keeping packs under ~25 k per node), raises
+seals packs at 2 GiB by default (`--pack-size`; 512 packs per TiB, so
+raise it on nodes whose pack count would approach ~25 k), raises
 `vm.max_map_count` in the operations guide, and refuses to start a node
 whose pack count is within headroom of that limit rather than fail its
 next seal. Mapping whole segments has a second cost: the kernel keeps
@@ -2049,7 +2049,8 @@ compaction at line 0 over unowned bytes (a weight cut must actually free
 space), refuses uploads, and keeps accepting reconcile traffic.
 
 Node configuration is flags/env only (`--store`, `--jobs`, `--rate` for
-the reconcile copier, `--min-free`); everything cluster-wide is in the
+the reconcile copier, `--min-free`, `--pack-size`); everything
+cluster-wide is in the
 view. Logs are structured (`slog`), one line per completed operation with
 peer ID, bytes, duration. `status` exposes counters for a scraper: objects,
 bytes, garbage after the last epoch, *foreign* bytes (records the node
@@ -2078,7 +2079,7 @@ recovery and backup, gateway mode, the benchmark. Simulation and the Quint model
 | view | ~100 B per node; a 50-node view is ~5 KB |
 | catalog | 10^6 references × ~300 B ≈ 300 MB per voter, plus tombstones until purged |
 | pins | 16 B per dedup-hit key negotiated or found present in an old pack within two `gc_interval`s; fresh uploads pin nothing |
-| per-pack meta | ~40 B per pack; 1024 packs per TiB at 1 GiB segments |
+| per-pack meta | ~40 B per pack; 512 packs per TiB at the default 2 GiB packs |
 | node size | 10–20 TiB per node while packstore maps whole segments (§13); beyond that needs bodies read by `pread` |
 | page tables | ~2 GiB per TiB of pack bytes read through mmap, freed only at unmap (§13) |
 | reconcile key lists | 32 B per key per target owner |

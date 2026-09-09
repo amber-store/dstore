@@ -79,9 +79,14 @@ type Config struct {
 	PutChunkBytes int
 	// NoSync disables packstore fsyncs (tests only).
 	NoSync bool
-	// SegmentSize overrides the packstore segment size.
+	// SegmentSize is the packstore segment (pack) size: the active pack is
+	// sealed once it reaches this many bytes. Default DefaultSegmentSize.
 	SegmentSize int64
 }
+
+// DefaultSegmentSize is the pack size a node uses unless Config.SegmentSize
+// says otherwise: 2 GiB.
+const DefaultSegmentSize int64 = 2 << 30
 
 func (c *Config) defaults() {
 	def := func(d *time.Duration, v time.Duration) {
@@ -106,6 +111,9 @@ func (c *Config) defaults() {
 	def(&c.ForwardTimeout, 30*time.Second)
 	if c.PutChunkBytes <= 0 {
 		c.PutChunkBytes = 8 << 20
+	}
+	if c.SegmentSize <= 0 {
+		c.SegmentSize = DefaultSegmentSize
 	}
 	def(&c.MaintenanceTick, 5*time.Second)
 	if c.Logger == nil {
@@ -191,11 +199,8 @@ func Open(cfg Config) (*Node, error) {
 	n := &Node{cfg: cfg, log: cfg.Logger, ep: cfg.Endpoint, id: cfg.Endpoint.ID(),
 		unreachable: map[view.NodeID]time.Time{}, completeCache: map[[32]byte]time.Time{}, recent: map[[32]byte]time.Time{}, joinAddrs: map[view.NodeID][]string{}}
 	n.log = n.log.With("node", view.ShortID(n.id))
-	opts := []packstore.Option{packstore.WithSync(!cfg.NoSync)}
-	if cfg.SegmentSize > 0 {
-		opts = append(opts, packstore.WithSegmentSize(cfg.SegmentSize))
-	}
-	st, err := packstore.Open(filepath.Join(cfg.StoreDir, "packstore"), opts...)
+	st, err := packstore.Open(filepath.Join(cfg.StoreDir, "packstore"),
+		packstore.WithSync(!cfg.NoSync), packstore.WithSegmentSize(cfg.SegmentSize))
 	if err != nil {
 		return nil, err
 	}
