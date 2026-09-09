@@ -38,6 +38,7 @@ func (c *Cluster) Push(ctx context.Context, local *packstore.Store, root key.Key
 	}
 	st.Keys = len(all)
 	src := func(k [32]byte) ([]byte, error) { return local.GetRecord(key.Key(k)) }
+	size := storedSizer(local)
 	tr := newTracker(c, prog)
 	obs := tr.observer()
 
@@ -56,7 +57,7 @@ func (c *Cluster) Push(ctx context.Context, local *packstore.Store, root key.Key
 		for k, err := range mr.Failed {
 			return st, fmt.Errorf("negotiate %x at its primary: %w", k[:8], err)
 		}
-		lacking, lackBytes := countKeys(mr.Lacking)
+		lacking, lackBytes := countKeys(mr.Lacking, size)
 		if round == 0 {
 			tr.totals(len(all), len(all)-lacking, lackBytes)
 			c.log.Info("negotiated", "objects", len(all), "present", len(all)-lacking, "upload", lacking, "bytes", lackBytes, "primaries", len(mr.Lacking))
@@ -65,7 +66,7 @@ func (c *Cluster) Push(ctx context.Context, local *packstore.Store, root key.Key
 			c.log.Info("re-sending objects short at their primaries", "round", round+1, "objects", lacking, "bytes", lackBytes)
 		}
 		if len(mr.Lacking) > 0 {
-			pr := c.Put(ctx, mr.Lacking, src, obs)
+			pr := c.Put(ctx, mr.Lacking, src, size, obs)
 			n := 0
 			for k, h := range pr.Holders {
 				if _, had := holders[k]; !had {
@@ -98,7 +99,7 @@ func (c *Cluster) Push(ctx context.Context, local *packstore.Store, root key.Key
 		// Re-put short keys to their primaries; on the last round send
 		// them to the lacking owners directly.
 		if round == 1 {
-			if err := c.directFill(ctx, short, holders, src, tr); err != nil {
+			if err := c.directFill(ctx, short, holders, src, size, tr); err != nil {
 				return st, err
 			}
 		}
@@ -137,9 +138,9 @@ func (c *Cluster) Push(ctx context.Context, local *packstore.Store, root key.Key
 			return st, merr
 		}
 		if len(mr.Lacking) > 0 {
-			_, lackBytes := countKeys(mr.Lacking)
+			_, lackBytes := countKeys(mr.Lacking, size)
 			tr.more(lackBytes)
-			c.Put(ctx, mr.Lacking, src, obs)
+			c.Put(ctx, mr.Lacking, src, size, obs)
 		}
 		var short [][32]byte
 		for _, k := range all {
@@ -148,7 +149,7 @@ func (c *Cluster) Push(ctx context.Context, local *packstore.Store, root key.Key
 			}
 		}
 		if len(short) > 0 {
-			if err := c.directFill(ctx, short, mr.Holders, src, tr); err != nil {
+			if err := c.directFill(ctx, short, mr.Holders, src, size, tr); err != nil {
 				return st, err
 			}
 		}
@@ -158,7 +159,7 @@ func (c *Cluster) Push(ctx context.Context, local *packstore.Store, root key.Key
 }
 
 // directFill sends short keys straight to the owners that lack them.
-func (c *Cluster) directFill(ctx context.Context, short [][32]byte, holders map[[32]byte][]view.NodeID, src RecordSource, tr *tracker) error {
+func (c *Cluster) directFill(ctx context.Context, short [][32]byte, holders map[[32]byte][]view.NodeID, src RecordSource, size RecordSizer, tr *tracker) error {
 	byOwner := map[view.NodeID][][32]byte{}
 	for _, k := range short {
 		have := map[view.NodeID]bool{}
@@ -174,14 +175,25 @@ func (c *Cluster) directFill(ctx context.Context, short [][32]byte, holders map[
 	if len(byOwner) == 0 {
 		return nil
 	}
-	_, bytes := countKeys(byOwner)
+	_, bytes := countKeys(byOwner, size)
 	tr.more(bytes)
 	c.log.Info("sending short objects to their owners directly", "objects", len(short), "owners", len(byOwner), "bytes", bytes)
-	pr := c.Put(ctx, byOwner, src, tr.observer())
+	pr := c.Put(ctx, byOwner, src, size, tr.observer())
 	for k, h := range pr.Holders {
 		holders[k] = mergeIDs(holders[k], h)
 	}
 	return nil
+}
+
+// storedSizer sizes records by the local packstore's index, falling back
+// to the key's length field for a key the store does not hold.
+func storedSizer(local *packstore.Store) RecordSizer {
+	return func(k [32]byte) int {
+		if n, ok, err := local.StoredSize(key.Key(k)); err == nil && ok {
+			return amberpack.RecHeaderSize + int(n)
+		}
+		return int(key.Key(k).Length())
+	}
 }
 
 func mergeIDs(a, b []view.NodeID) []view.NodeID {

@@ -106,7 +106,7 @@ type RecordSource func(k [32]byte) ([]byte, error)
 
 // Put uploads records to their primaries in byte-balanced batches, in
 // parallel across primaries (§6.2 steps 3–4). The primaries replicate.
-func (c *Cluster) Put(ctx context.Context, byPrimary map[view.NodeID][][32]byte, src RecordSource, obs PutObserver) *PutResult {
+func (c *Cluster) Put(ctx context.Context, byPrimary map[view.NodeID][][32]byte, src RecordSource, size RecordSizer, obs PutObserver) *PutResult {
 	res := &PutResult{Holders: map[[32]byte][]view.NodeID{}, Failed: map[[32]byte][]wire.KeyFailure{}, Rejected: map[[32]byte]string{}, Errors: map[view.NodeID]error{}}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -115,60 +115,49 @@ func (c *Cluster) Put(ctx context.Context, byPrimary map[view.NodeID][][32]byte,
 		wg.Add(1)
 		go func(p view.NodeID, ks [][32]byte) {
 			defer wg.Done()
-			// Byte-balanced batches.
-			var batch [][32]byte
-			var size int
-			flush := func() {
-				if len(batch) == 0 {
-					return
-				}
+			for _, b := range batches(ks, size, batchBytes, batchKeys) {
 				sem <- struct{}{}
-				b := batch
-				batch, size = nil, 0
-				resp, err := c.putBatch(ctx, p, b, src, obs)
+				resp, err := c.putBatch(ctx, p, b, src, size, obs)
 				<-sem
 				mu.Lock()
-				defer mu.Unlock()
 				if err != nil {
 					res.Errors[p] = err
+					mu.Unlock()
 					return
 				}
-				for _, h := range resp.Holders {
-					if len(h.Key) == 32 {
-						res.Holders[[32]byte(h.Key)] = view.IDsOf(h.Holders)
-					}
-				}
-				for _, f := range resp.Failed {
-					if len(f.Key) == 32 {
-						res.Failed[[32]byte(f.Key)] = append(res.Failed[[32]byte(f.Key)], f)
-					}
-				}
-				for _, r := range resp.Rejected {
-					if len(r.Key) == 32 {
-						res.Rejected[[32]byte(r.Key)] = r.Reason
-					}
-				}
+				res.merge(resp)
+				mu.Unlock()
 			}
-			for _, k := range ks {
-				n := int(key.Key(k).Length())
-				if len(batch) > 0 && (size+n > batchBytes || len(batch) >= batchKeys) {
-					flush()
-				}
-				batch = append(batch, k)
-				size += n
-			}
-			flush()
 		}(p, ks)
 	}
 	wg.Wait()
 	return res
 }
 
+// merge folds one batch reply into the result; the caller holds the lock.
+func (r *PutResult) merge(resp *wire.Msg) {
+	for _, h := range resp.Holders {
+		if len(h.Key) == 32 {
+			r.Holders[[32]byte(h.Key)] = view.IDsOf(h.Holders)
+		}
+	}
+	for _, f := range resp.Failed {
+		if len(f.Key) == 32 {
+			r.Failed[[32]byte(f.Key)] = append(r.Failed[[32]byte(f.Key)], f)
+		}
+	}
+	for _, rj := range resp.Rejected {
+		if len(rj.Key) == 32 {
+			r.Rejected[[32]byte(rj.Key)] = rj.Reason
+		}
+	}
+}
+
 // putBatch streams one batch to a primary.
-func (c *Cluster) putBatch(ctx context.Context, p view.NodeID, keys [][32]byte, src RecordSource, obs PutObserver) (*wire.Msg, error) {
+func (c *Cluster) putBatch(ctx context.Context, p view.NodeID, keys [][32]byte, src RecordSource, size RecordSizer, obs PutObserver) (*wire.Msg, error) {
 	var last error
 	for attempt := 0; attempt < 4; attempt++ {
-		resp, err := c.putOnce(ctx, p, keys, src, obs)
+		resp, err := c.putOnce(ctx, p, keys, src, size, obs)
 		if err == nil {
 			return resp, nil
 		}
@@ -193,12 +182,12 @@ func (c *Cluster) putBatch(ctx context.Context, p view.NodeID, keys [][32]byte, 
 	return nil, last
 }
 
-func (c *Cluster) putOnce(ctx context.Context, p view.NodeID, keys [][32]byte, src RecordSource, obs PutObserver) (*wire.Msg, error) {
+func (c *Cluster) putOnce(ctx context.Context, p view.NodeID, keys [][32]byte, src RecordSource, size RecordSizer, obs PutObserver) (*wire.Msg, error) {
 	cctx, cancel := context.WithTimeout(ctx, 10*c.cfg.RequestTimeout)
 	defer cancel()
 	var total int64
 	for _, k := range keys {
-		total += int64(key.Key(k).Length())
+		total += int64(size(k))
 	}
 	if obs.Start != nil {
 		obs.Start(p)
@@ -228,7 +217,7 @@ func (c *Cluster) putOnce(ctx context.Context, p view.NodeID, keys [][32]byte, s
 				return
 			}
 			if obs.Sent != nil {
-				obs.Sent(p, int(key.Key(k).Length()))
+				obs.Sent(p, len(rec))
 			}
 		}
 	})

@@ -470,6 +470,20 @@ func TestClusterPushProgress(t *testing.T) {
 	if last.Objects != last.TotalObjects || last.Bytes != last.TotalBytes || last.TotalBytes != st.Bytes || st.Bytes == 0 {
 		t.Fatalf("final report %+v, stats %+v", last, st)
 	}
+	// Bytes count what went over the wire: the records, not the logical
+	// lengths in the keys (a tree object's key carries its subtree's size).
+	keys, _ := fstree.ReachableKeys(root, local.Get)
+	var wire int64
+	for _, k := range keys {
+		rec, err := local.GetRecord(k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wire += int64(len(rec))
+	}
+	if st.Bytes != wire {
+		t.Fatalf("push stats count %d bytes, the records are %d bytes", st.Bytes, wire)
+	}
 	var sum int64
 	for _, n := range last.Nodes {
 		sum += n.Bytes
