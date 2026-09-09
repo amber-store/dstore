@@ -668,6 +668,26 @@ func (n *Node) clearCorrupt(k [32]byte) {
 	_ = n.meta.Delete(append([]byte(mkCorrupt), k[:]...))
 }
 
+// clearCorruptKeys drops the corrupt markers of the keys that carry one in
+// a single synced write. A marker is rare, so a batch of fresh records
+// usually costs no write at all here; one synced delete per key made a
+// 60 MiB batch take a minute per replica.
+func (n *Node) clearCorruptKeys(keys [][32]byte) {
+	var b *meta.Batch
+	for _, k := range keys {
+		if !n.isCorrupt(k) {
+			continue
+		}
+		if b == nil {
+			b = n.meta.NewBatch()
+		}
+		b.Delete(append([]byte(mkCorrupt), k[:]...))
+	}
+	if b != nil {
+		_ = b.Commit()
+	}
+}
+
 // ---- helpers ----
 
 // InitCluster writes the first view of a new cluster onto this node's

@@ -22,9 +22,6 @@ type PushStats struct {
 	Version  []byte
 }
 
-// Progress receives push/pull progress, if set.
-type Progress func(done, total int)
-
 // Push uploads the tree under root from local and writes the reference
 // (§11.4). Every record is sent once, to a primary; the ack policy is
 // checked per key; keys short at an owner are re-sent and, failing that,
@@ -41,6 +38,8 @@ func (c *Cluster) Push(ctx context.Context, local *packstore.Store, root key.Key
 	}
 	st.Keys = len(all)
 	src := func(k [32]byte) ([]byte, error) { return local.GetRecord(key.Key(k)) }
+	tr := newTracker(c, prog)
+	obs := tr.observer()
 
 	start := time.Now()
 	lastPin := start
@@ -57,16 +56,25 @@ func (c *Cluster) Push(ctx context.Context, local *packstore.Store, root key.Key
 		for k, err := range mr.Failed {
 			return st, fmt.Errorf("negotiate %x at its primary: %w", k[:8], err)
 		}
+		lacking, lackBytes := countKeys(mr.Lacking)
+		if round == 0 {
+			tr.totals(len(all), len(all)-lacking, lackBytes)
+			c.log.Info("negotiated", "objects", len(all), "present", len(all)-lacking, "upload", lacking, "bytes", lackBytes, "primaries", len(mr.Lacking))
+		} else {
+			tr.more(lackBytes)
+			c.log.Info("re-sending objects short at their primaries", "round", round+1, "objects", lacking, "bytes", lackBytes)
+		}
 		if len(mr.Lacking) > 0 {
-			pr := c.Put(ctx, mr.Lacking, src)
+			pr := c.Put(ctx, mr.Lacking, src, obs)
+			n := 0
 			for k, h := range pr.Holders {
-				holders[k] = h
-				uploaded++
-				st.Bytes += int64(key.Key(k).Length())
-				if prog != nil {
-					prog(uploaded, len(all))
+				if _, had := holders[k]; !had {
+					uploaded++
+					n++
 				}
+				holders[k] = h
 			}
+			tr.objects(n)
 			for p, err := range pr.Errors {
 				return st, fmt.Errorf("upload to %s: %w", view.ShortID(p), err)
 			}
@@ -90,12 +98,10 @@ func (c *Cluster) Push(ctx context.Context, local *packstore.Store, root key.Key
 		// Re-put short keys to their primaries; on the last round send
 		// them to the lacking owners directly.
 		if round == 1 {
-			if err := c.directFill(ctx, short, holders, src); err != nil {
+			if err := c.directFill(ctx, short, holders, src, tr); err != nil {
 				return st, err
 			}
 		}
-		all2 := short
-		_ = all2
 		// Re-pin everything uploaded so far if the push runs long.
 		if time.Since(lastPin) > c.cfg.GCInterval/2 {
 			_, _ = c.Missing(ctx, all, true)
@@ -103,6 +109,9 @@ func (c *Cluster) Push(ctx context.Context, local *packstore.Store, root key.Key
 		}
 	}
 	st.Uploaded = uploaded
+	st.Bytes = tr.bytes()
+	took := time.Since(start)
+	c.log.Info("upload complete", "uploaded", uploaded, "bytes", st.Bytes, "took", took.Round(time.Millisecond), "rate", Rate(st.Bytes, took))
 
 	rec := reference.Reference{Name: name, Key: root[:], User: user, CreatedAt: time.Now().UnixNano()}
 	enc, err := rec.Encode()
@@ -113,6 +122,7 @@ func (c *Cluster) Push(ctx context.Context, local *packstore.Store, root key.Key
 		version, err := c.RefPut(ctx, enc, cond)
 		if err == nil {
 			st.Version = version
+			c.log.Info("reference written", "name", name, "version", fmt.Sprintf("%x", version))
 			return st, nil
 		}
 		var inc *Incomplete
@@ -121,12 +131,15 @@ func (c *Cluster) Push(ctx context.Context, local *packstore.Store, root key.Key
 		}
 		// GC may have reaped a dedup hit between negotiation and gate:
 		// re-run the whole negotiation and send what is missing anywhere.
+		c.log.Warn("reference write incomplete, renegotiating", "attempt", attempt+1, "err", err)
 		mr, merr := c.Missing(ctx, all, true)
 		if merr != nil {
 			return st, merr
 		}
 		if len(mr.Lacking) > 0 {
-			c.Put(ctx, mr.Lacking, src)
+			_, lackBytes := countKeys(mr.Lacking)
+			tr.more(lackBytes)
+			c.Put(ctx, mr.Lacking, src, obs)
 		}
 		var short [][32]byte
 		for _, k := range all {
@@ -135,16 +148,17 @@ func (c *Cluster) Push(ctx context.Context, local *packstore.Store, root key.Key
 			}
 		}
 		if len(short) > 0 {
-			if err := c.directFill(ctx, short, mr.Holders, src); err != nil {
+			if err := c.directFill(ctx, short, mr.Holders, src, tr); err != nil {
 				return st, err
 			}
 		}
+		st.Bytes = tr.bytes()
 	}
 	return st, errors.New("push: reference write did not complete")
 }
 
 // directFill sends short keys straight to the owners that lack them.
-func (c *Cluster) directFill(ctx context.Context, short [][32]byte, holders map[[32]byte][]view.NodeID, src RecordSource) error {
+func (c *Cluster) directFill(ctx context.Context, short [][32]byte, holders map[[32]byte][]view.NodeID, src RecordSource, tr *tracker) error {
 	byOwner := map[view.NodeID][][32]byte{}
 	for _, k := range short {
 		have := map[view.NodeID]bool{}
@@ -160,7 +174,10 @@ func (c *Cluster) directFill(ctx context.Context, short [][32]byte, holders map[
 	if len(byOwner) == 0 {
 		return nil
 	}
-	pr := c.Put(ctx, byOwner, src)
+	_, bytes := countKeys(byOwner)
+	tr.more(bytes)
+	c.log.Info("sending short objects to their owners directly", "objects", len(short), "owners", len(byOwner), "bytes", bytes)
+	pr := c.Put(ctx, byOwner, src, tr.observer())
 	for k, h := range pr.Holders {
 		holders[k] = mergeIDs(holders[k], h)
 	}
@@ -297,7 +314,7 @@ func (c *Cluster) PullTree(ctx context.Context, local *packstore.Store, root key
 			st.Fetched++
 			st.Bytes += int64(len(r.Record))
 			if prog != nil {
-				prog(st.Fetched, st.Keys)
+				prog(ProgressReport{Objects: st.Fetched, TotalObjects: st.Keys, Bytes: st.Bytes})
 			}
 			if k.Type() != key.Blob && k.Type() != key.XattrSet {
 				rec, err := amberpack.ParseRecord(r.Record)

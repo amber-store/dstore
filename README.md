@@ -85,6 +85,13 @@ or two with the default timers (`cluster status` shows its progress);
 the second node's vote is deferred until a third node joins, when the
 catalog goes from one voter to three in one step (§5.4).
 
+`push` and `pull` show a progress display when stderr is a terminal: a
+bar, throughput and time left, a per-node table (path, batches in
+flight, bytes, rate) and the client's last events; Ctrl+C cancels the
+transfer cleanly. `--no-tui` (or `DSTORE_NO_TUI=1`) prints plain log
+lines and a status line every five seconds instead, which is also what a
+non-terminal stderr gets.
+
 ## Tests
 
 ```

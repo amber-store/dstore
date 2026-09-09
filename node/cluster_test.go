@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -426,4 +427,57 @@ func TestClusterNodeDownDuringWrite(t *testing.T) {
 		}
 		return true
 	})
+}
+
+// TestClusterPushProgress checks the progress reports a push emits: bytes
+// are counted per record as they go to the wire, the totals are known from
+// negotiation on, and the per-node shares add up to the whole.
+func TestClusterPushProgress(t *testing.T) {
+	h := cluster3(t)
+	defer h.close()
+	ctx := context.Background()
+	c := h.client(t, 100)
+	defer c.Close()
+
+	local, root, _ := makeTree(t, 30, 20000)
+	var mu sync.Mutex
+	var reports []client.ProgressReport
+	prog := func(r client.ProgressReport) {
+		mu.Lock()
+		defer mu.Unlock()
+		reports = append(reports, r)
+	}
+	st, err := c.Push(ctx, local, root, "trees/p", "tester", client.Cond{Force: true}, prog)
+	if err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(reports) < 10 {
+		t.Fatalf("only %d progress reports for %d objects", len(reports), st.Keys)
+	}
+	var lastBytes int64
+	for i, r := range reports {
+		if r.Bytes < lastBytes {
+			t.Fatalf("report %d: bytes went from %d to %d", i, lastBytes, r.Bytes)
+		}
+		lastBytes = r.Bytes
+		if r.TotalObjects != st.Keys {
+			t.Fatalf("report %d: total objects %d, want %d", i, r.TotalObjects, st.Keys)
+		}
+	}
+	last := reports[len(reports)-1]
+	if last.Objects != last.TotalObjects || last.Bytes != last.TotalBytes || last.TotalBytes != st.Bytes || st.Bytes == 0 {
+		t.Fatalf("final report %+v, stats %+v", last, st)
+	}
+	var sum int64
+	for _, n := range last.Nodes {
+		sum += n.Bytes
+		if n.InFlight != 0 || n.Awaiting != 0 {
+			t.Fatalf("node %s still has %d batches in flight, %d awaiting", view.ShortID(n.ID), n.InFlight, n.Awaiting)
+		}
+	}
+	if len(last.Nodes) == 0 || sum != last.Bytes {
+		t.Fatalf("node bytes %d over %d nodes, want %d", sum, len(last.Nodes), last.Bytes)
+	}
 }

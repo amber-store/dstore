@@ -106,7 +106,7 @@ type RecordSource func(k [32]byte) ([]byte, error)
 
 // Put uploads records to their primaries in byte-balanced batches, in
 // parallel across primaries (§6.2 steps 3–4). The primaries replicate.
-func (c *Cluster) Put(ctx context.Context, byPrimary map[view.NodeID][][32]byte, src RecordSource) *PutResult {
+func (c *Cluster) Put(ctx context.Context, byPrimary map[view.NodeID][][32]byte, src RecordSource, obs PutObserver) *PutResult {
 	res := &PutResult{Holders: map[[32]byte][]view.NodeID{}, Failed: map[[32]byte][]wire.KeyFailure{}, Rejected: map[[32]byte]string{}, Errors: map[view.NodeID]error{}}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -125,7 +125,7 @@ func (c *Cluster) Put(ctx context.Context, byPrimary map[view.NodeID][][32]byte,
 				sem <- struct{}{}
 				b := batch
 				batch, size = nil, 0
-				resp, err := c.putBatch(ctx, p, b, src)
+				resp, err := c.putBatch(ctx, p, b, src, obs)
 				<-sem
 				mu.Lock()
 				defer mu.Unlock()
@@ -165,40 +165,56 @@ func (c *Cluster) Put(ctx context.Context, byPrimary map[view.NodeID][][32]byte,
 }
 
 // putBatch streams one batch to a primary.
-func (c *Cluster) putBatch(ctx context.Context, p view.NodeID, keys [][32]byte, src RecordSource) (*wire.Msg, error) {
+func (c *Cluster) putBatch(ctx context.Context, p view.NodeID, keys [][32]byte, src RecordSource, obs PutObserver) (*wire.Msg, error) {
 	var last error
 	for attempt := 0; attempt < 4; attempt++ {
-		resp, err := c.putOnce(ctx, p, keys, src)
+		resp, err := c.putOnce(ctx, p, keys, src, obs)
 		if err == nil {
 			return resp, nil
 		}
 		last = err
 		if wire.IsCode(err, wire.CodeStaleView) {
+			c.log.Warn("upload retry", "node", view.ShortID(p), "reason", "stale view", "attempt", attempt+1)
 			c.handleErr(p, err)
 			continue
 		}
 		if wire.IsCode(err, wire.CodeBusy) {
+			wait := time.Second
 			if we, ok := wire.AsError(err); ok && we.RetryAfter > 0 {
-				time.Sleep(we.RetryAfter)
-			} else {
-				time.Sleep(time.Second)
+				wait = we.RetryAfter
 			}
+			c.log.Warn("upload retry", "node", view.ShortID(p), "reason", "busy", "wait", wait, "attempt", attempt+1)
+			time.Sleep(wait)
 			continue
 		}
+		c.log.Warn("upload failed", "node", view.ShortID(p), "objects", len(keys), "err", err)
 		return nil, err
 	}
 	return nil, last
 }
 
-func (c *Cluster) putOnce(ctx context.Context, p view.NodeID, keys [][32]byte, src RecordSource) (*wire.Msg, error) {
+func (c *Cluster) putOnce(ctx context.Context, p view.NodeID, keys [][32]byte, src RecordSource, obs PutObserver) (*wire.Msg, error) {
 	cctx, cancel := context.WithTimeout(ctx, 10*c.cfg.RequestTimeout)
 	defer cancel()
+	var total int64
+	for _, k := range keys {
+		total += int64(key.Key(k).Length())
+	}
+	if obs.Start != nil {
+		obs.Start(p)
+	}
+	flushed := false
+	if obs.Done != nil {
+		defer func() { obs.Done(p, flushed) }()
+	}
+	began := time.Now()
 	s, err := c.pool.Open(cctx, p, wire.ALPNClient)
 	if err != nil {
 		c.handleErr(p, err)
 		return nil, err
 	}
 	defer wire.CloseStream(s)
+	c.log.Info("uploading", append([]any{"node", view.ShortID(p), "objects", len(keys), "bytes", total}, c.pathAttrs(p)...)...)
 	if err := wire.WriteMsg(s, c.stamp(&wire.Msg{Type: wire.TPut})); err != nil {
 		return nil, err
 	}
@@ -211,18 +227,28 @@ func (c *Cluster) putOnce(ctx context.Context, p view.NodeID, keys [][32]byte, s
 			if !yield(rec, nil) {
 				return
 			}
+			if obs.Sent != nil {
+				obs.Sent(p, int(key.Key(k).Length()))
+			}
 		}
 	})
 	if err != nil {
 		return nil, err
 	}
 	_ = s.CloseWrite()
+	flushed = true
+	if obs.Flushed != nil {
+		obs.Flushed(p)
+	}
+	c.log.Info("batch sent, waiting for the node to store and replicate it", "node", view.ShortID(p), "objects", len(keys), "bytes", total)
 	resp, err := wire.Expect(s, wire.TPutResult)
 	if err != nil {
 		c.handleErr(p, err)
 		return nil, err
 	}
 	c.ok(p)
+	took := time.Since(began)
+	c.log.Info("uploaded", "node", view.ShortID(p), "objects", len(keys), "bytes", total, "took", took.Round(time.Millisecond), "rate", Rate(total, took))
 	return resp, nil
 }
 

@@ -397,9 +397,7 @@ func (n *Node) storeBatch(b *putBatch) (stored, dedup int, err error) {
 		if _, err := n.store.WriteParallel(seq, packstore.WriteOpts{Writers: 1}); err != nil {
 			return 0, 0, err
 		}
-		for _, k := range fresh {
-			n.clearCorrupt(k)
-		}
+		n.clearCorruptKeys(fresh)
 		n.noteRecent(fresh)
 	}
 	if len(hits) > 0 {
