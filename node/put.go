@@ -152,7 +152,8 @@ func (tx *putTx) abort() {
 func (tx *putTx) forwarder(o view.NodeID) *forwarder {
 	f := tx.fwd[o]
 	if f == nil {
-		f = &forwarder{tx: tx, to: o, ch: make(chan []byte, 64), done: make(chan struct{})}
+		ctx, cancel := context.WithCancel(tx.ctx)
+		f = &forwarder{tx: tx, to: o, ctx: ctx, cancel: cancel, ch: make(chan []byte, 64), done: make(chan struct{})}
 		tx.fwd[o] = f
 		go f.run()
 	}
@@ -162,11 +163,13 @@ func (tx *putTx) forwarder(o view.NodeID) *forwarder {
 // forwarder streams a batch's records for one other owner over a put on
 // the cluster ALPN as they arrive.
 type forwarder struct {
-	tx   *putTx
-	to   view.NodeID
-	ch   chan []byte
-	keys [][32]byte // handed to it, in order; the handler's goroutine only
-	done chan struct{}
+	tx     *putTx
+	to     view.NodeID
+	ctx    context.Context // cancelled by giveUp, aborting a dial in progress
+	cancel context.CancelFunc
+	ch     chan []byte
+	keys   [][32]byte // handed to it, in order; the handler's goroutine only
+	done   chan struct{}
 
 	once sync.Once
 	mu   sync.Mutex
@@ -181,6 +184,12 @@ type forwarder struct {
 // and the reconcile pass heals them (§6.2).
 func (f *forwarder) send(k [32]byte, rec []byte) {
 	f.keys = append(f.keys, k)
+	f.mu.Lock()
+	dead := f.dead
+	f.mu.Unlock()
+	if dead {
+		return
+	}
 	select {
 	case f.ch <- rec:
 		return
@@ -200,7 +209,7 @@ func (f *forwarder) send(k [32]byte, rec []byte) {
 
 func (f *forwarder) close() { f.once.Do(func() { close(f.ch) }) }
 
-// giveUp cuts the stream so that a blocked send returns.
+// giveUp cuts the dial or the stream so that a blocked send returns.
 func (f *forwarder) giveUp(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -209,6 +218,7 @@ func (f *forwarder) giveUp(err error) {
 	}
 	f.dead = true
 	f.err = err
+	f.cancel()
 	if f.s != nil {
 		_ = f.s.Close()
 		f.s.CancelRead(0)
@@ -225,8 +235,13 @@ func (f *forwarder) fail(err error) {
 
 func (f *forwarder) run() {
 	defer close(f.done)
+	defer f.cancel()
 	n := f.tx.n
-	s, err := n.pool.Open(f.tx.ctx, f.to, wire.ALPNCluster)
+	// An owner that cannot be reached within the forward timeout fails
+	// its keys for this batch; the reconcile pass heals them (§6.2).
+	octx, ocancel := context.WithTimeout(f.ctx, n.cfg.ForwardTimeout)
+	s, err := n.pool.Open(octx, f.to, wire.ALPNCluster)
+	ocancel()
 	if err != nil {
 		n.markUnreachable(f.to, err)
 		f.fail(err)
@@ -281,9 +296,9 @@ func (f *forwarder) run() {
 	case <-t.C:
 		s.CancelRead(0)
 		f.fail(context.DeadlineExceeded)
-	case <-f.tx.ctx.Done():
+	case <-f.ctx.Done():
 		s.CancelRead(0)
-		f.fail(f.tx.ctx.Err())
+		f.fail(f.ctx.Err())
 	}
 }
 

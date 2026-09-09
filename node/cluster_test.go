@@ -40,6 +40,7 @@ type harness struct {
 	nodes []*node.Node
 	dirs  []string
 	log   *slog.Logger
+	tweak func(*node.Config) // adjusts every node's config
 }
 
 func testLogger(t *testing.T) *slog.Logger {
@@ -56,7 +57,7 @@ func newHarness(t *testing.T) *harness {
 
 func (h *harness) config(i byte, dir string) node.Config {
 	ep := h.net.Bind(nid(i), wire.ALPNClient, wire.ALPNCluster)
-	return node.Config{
+	cfg := node.Config{
 		StoreDir: dir, Endpoint: ep, Logger: h.log, NoSync: true, SegmentSize: 256 << 10,
 		MaintenanceTick: 200 * time.Millisecond, Lease: 3 * time.Second, ViewRefresh: time.Second,
 		AdoptTimeout: 3 * time.Second, ParticipantTimeout: 30 * time.Second, Delta: 2 * time.Second,
@@ -64,6 +65,10 @@ func (h *harness) config(i byte, dir string) node.Config {
 		MarkTimeout: 30 * time.Second, SweepTimeout: 30 * time.Second, Grace: time.Millisecond,
 		ForwardTimeout: 10 * time.Second, PutTTL: 10 * time.Minute, PutChunkBytes: 256 << 10,
 	}
+	if h.tweak != nil {
+		h.tweak(&cfg)
+	}
+	return cfg
 }
 
 func (h *harness) open(i byte) *node.Node {
@@ -123,8 +128,12 @@ func (h *harness) waitSteady(nodes int, voters int) {
 }
 
 // cluster3 builds a three-node cluster: init on node 1, join 2 and 3.
-func cluster3(t *testing.T) *harness {
+func cluster3(t *testing.T) *harness { return cluster3With(t, nil) }
+
+// cluster3With is cluster3 with every node's config adjusted by tweak.
+func cluster3With(t *testing.T, tweak func(*node.Config)) *harness {
 	h := newHarness(t)
+	h.tweak = tweak
 	ctx := context.Background()
 	n1 := h.open(1)
 	if _, err := n1.InitCluster(ctx, 3, 2, 100, "", false); err != nil {
@@ -646,8 +655,8 @@ func pushTree(t *testing.T, c *client.Cluster, files, size int, name string) (*p
 }
 
 // TestClusterGetYieldsBeforeEveryBatchIsFetched checks that Get streams:
-// with one worker and a stream-open latency, the first record must arrive
-// after one latency, not after every per-node batch has completed.
+// with one worker and a dial latency, the first record must arrive after
+// one latency, not after every per-node batch has completed.
 func TestClusterGetYieldsBeforeEveryBatchIsFetched(t *testing.T) {
 	h := cluster3(t)
 	defer h.close()
@@ -670,7 +679,7 @@ func TestClusterGetYieldsBeforeEveryBatchIsFetched(t *testing.T) {
 		break
 	}
 	if first == 0 || first >= 2*delay {
-		t.Fatalf("first record after %v with a %v stream latency: Get waited for every batch", first, delay)
+		t.Fatalf("first record after %v with a %v dial latency: Get waited for every batch", first, delay)
 	}
 }
 
@@ -749,5 +758,74 @@ func TestClusterPullWithNodeDown(t *testing.T) {
 		if err != nil || !bytes.Equal(a, b) {
 			t.Fatalf("object %x missing or different after pull", k[:8])
 		}
+	}
+}
+
+// TestClusterPutGivesUpASlowForward checks that a put does not wait for
+// a forward whose owner takes longer than the forward timeout to reach:
+// the key fails for this batch and the reply comes back at once.
+func TestClusterPutGivesUpASlowForward(t *testing.T) {
+	h := cluster3With(t, func(c *node.Config) { c.ForwardTimeout = time.Second })
+	defer h.close()
+	ctx := context.Background()
+	n1 := h.nodes[0]
+	ep := h.net.Bind(nid(100), wire.ALPNClient)
+	pool := transport.NewPool(ep, func(view.NodeID) []string { return n1.Endpoint().Addrs() }, 1)
+	defer pool.Close()
+
+	var recs [][]byte
+	for i := 0; i < 200; i++ {
+		data := make([]byte, 16<<10)
+		rand.Read(data)
+		k, err := key.New(key.Blob, uint64(len(data)), data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec, err := amberpack.EncodeRecord(k, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		recs = append(recs, rec)
+	}
+	s, err := pool.Open(ctx, n1.ID(), wire.ALPNClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wire.CloseStream(s)
+	// Every dial from here on takes far longer than the forward timeout,
+	// and the primary's connections to the other owners are dropped so
+	// that its forwards have to dial.
+	h.net.SetDelay(5 * time.Second)
+	defer h.net.SetDelay(0)
+	for _, i := range []byte{2, 3} {
+		h.net.SetDown(nid(i), true)
+		h.net.SetDown(nid(i), false)
+	}
+	v := n1.View()
+	if err := wire.WriteMsg(s, &wire.Msg{Type: wire.TPut, ClusterID: v.ClusterID, Incarnation: v.Incarnation, Epoch: v.Epoch}); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	err = wire.SendPackRecords(s, func(yield func([]byte, error) bool) {
+		for _, rec := range recs {
+			if !yield(rec, nil) {
+				return
+			}
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = s.CloseWrite()
+	resp, err := wire.Expect(s, wire.TPutResult)
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	took := time.Since(start)
+	if took >= 4*time.Second {
+		t.Fatalf("put took %v: it waited for forwards slower than the 1 s forward timeout", took)
+	}
+	if len(resp.Holders) != len(recs) || len(resp.Failed) == 0 {
+		t.Fatalf("reply: %d holders, %d failed; the slow owners should have failed", len(resp.Holders), len(resp.Failed))
 	}
 }
