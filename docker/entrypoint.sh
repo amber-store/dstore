@@ -12,7 +12,16 @@ if [ ! -f "$STORE/identity" ] && [ -n "${DSTORE_IDENTITY:-}" ]; then
   printf '%s\n' "$DSTORE_IDENTITY" > "$STORE/identity"
   umask 022
 fi
-set -- --store "$STORE" --bind "0.0.0.0:$PORT" --no-relay
+set -- --store "$STORE" --bind "0.0.0.0:$PORT"
+# Relay mode follows the CLI default (the built-in relay map) unless
+# DSTORE_RELAY names a relay or DSTORE_NO_RELAY turns relays off; with
+# relays the ticket carries the relay URL, so clients outside the
+# network can reach the node.
+if [ -n "${DSTORE_NO_RELAY:-}" ] && [ "$DSTORE_NO_RELAY" != "0" ] && [ "$DSTORE_NO_RELAY" != "false" ]; then
+  set -- "$@" --no-relay
+elif [ -n "${DSTORE_RELAY:-}" ]; then
+  set -- "$@" --relay "$DSTORE_RELAY"
+fi
 if [ -n "${DSTORE_ADVERTISE:-}" ]; then set -- "$@" --advertise-addr "$DSTORE_ADVERTISE"; fi
 if [ -n "${DSTORE_PAXOS_DIR:-}" ]; then set -- "$@" --paxos-dir "$DSTORE_PAXOS_DIR"; fi
 if [ -n "${DSTORE_GC_INTERVAL:-}" ]; then set -- "$@" --gc-interval "$DSTORE_GC_INTERVAL"; fi
