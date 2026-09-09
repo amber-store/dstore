@@ -198,6 +198,14 @@ func raceConnect(ctx context.Context, ep *iroh.Endpoint, id irohkey.EndpointID, 
 		cancels[i] = cancel
 		go func(ta netaddr.TransportAddr) {
 			conn, err := ep.Connect(actx, netaddr.NewEndpointAddr(id, ta), alpn)
+			if err == nil {
+				if err = awaitHandshake(actx, conn); err != nil {
+					conn = nil
+				}
+			}
+			if err != nil {
+				err = fmt.Errorf("dial %s: %w", ta, err)
+			}
 			results <- result{conn, err}
 		}(ta)
 	}
@@ -225,6 +233,23 @@ func raceConnect(ctx context.Context, ep *iroh.Endpoint, id irohkey.EndpointID, 
 		cancel()
 	}
 	return nil, errors.Join(errs...)
+}
+
+// awaitHandshake waits until conn has completed its handshake. With a cached
+// session ticket for the peer, go-iroh's Connect returns at the 0-RTT window,
+// before a single packet has come back, so a returned connection proves
+// nothing about the address it was dialed at: a candidate only wins the race
+// once the peer has answered on it. On ctx expiry the connection is closed.
+func awaitHandshake(ctx context.Context, conn *iroh.Conn) error {
+	select {
+	case <-conn.HandshakeComplete():
+		return nil
+	case <-conn.Context().Done():
+		return context.Cause(conn.Context())
+	case <-ctx.Done():
+		conn.Close()
+		return ctx.Err()
+	}
 }
 
 // Accept returns the next incoming connection.
