@@ -148,11 +148,20 @@ func cluster3(t *testing.T) *harness {
 }
 
 func (h *harness) client(t *testing.T, i byte) *client.Cluster {
+	return h.clientWith(t, i, nil)
+}
+
+// clientWith dials a client whose config tweak has adjusted.
+func (h *harness) clientWith(t *testing.T, i byte, tweak func(*client.Config)) *client.Cluster {
 	ep := h.net.Bind(nid(i), wire.ALPNClient)
 	n1 := h.nodes[0]
 	id1 := n1.ID()
 	tk := ticket.Ticket{Members: []ticket.Member{{ID: id1[:], Addrs: n1.Endpoint().Addrs()}}}
-	c, err := client.Dial(context.Background(), client.Config{Endpoint: ep, Ticket: tk, Logger: h.log, RequestTimeout: 20 * time.Second})
+	cfg := client.Config{Endpoint: ep, Ticket: tk, Logger: h.log, RequestTimeout: 20 * time.Second}
+	if tweak != nil {
+		tweak(&cfg)
+	}
+	c, err := client.Dial(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -504,5 +513,30 @@ func TestClusterPushProgress(t *testing.T) {
 		if n.Bytes == 0 {
 			t.Fatalf("node %s received nothing", view.ShortID(n.ID))
 		}
+	}
+}
+
+// TestClusterPushPipelines checks that a push keeps several batches in
+// flight per primary, so that the wait for one batch's store and
+// replication overlaps the next batch's transfer.
+func TestClusterPushPipelines(t *testing.T) {
+	h := cluster3(t)
+	defer h.close()
+	ctx := context.Background()
+	c := h.clientWith(t, 100, func(cfg *client.Config) { cfg.BatchBytes = 64 << 10 })
+	defer c.Close()
+
+	local, root, _ := makeTree(t, 30, 20000)
+	maxInFlight := 0 // prog runs under the transfer's lock
+	prog := func(r client.ProgressReport) {
+		for _, n := range r.Nodes {
+			maxInFlight = max(maxInFlight, n.InFlight)
+		}
+	}
+	if _, err := c.Push(ctx, local, root, "trees/pipe", "tester", client.Cond{Force: true}, prog); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if maxInFlight < 2 {
+		t.Fatalf("at most %d batch in flight per node: batches are not pipelined", maxInFlight)
 	}
 }

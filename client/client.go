@@ -31,6 +31,9 @@ type Config struct {
 	GCInterval time.Duration
 	// RequestTimeout bounds one request; default 2 min.
 	RequestTimeout time.Duration
+	// BatchBytes is the target size of one put batch; default 16 MiB, at
+	// most wire.MaxPutBatch. Conns batches are in flight per primary.
+	BatchBytes int
 }
 
 // Cluster is a handle on a dstore cluster.
@@ -69,6 +72,10 @@ func Dial(ctx context.Context, cfg Config) (*Cluster, error) {
 	if cfg.RequestTimeout == 0 {
 		cfg.RequestTimeout = 2 * time.Minute
 	}
+	if cfg.BatchBytes <= 0 {
+		cfg.BatchBytes = defaultBatchBytes
+	}
+	cfg.BatchBytes = min(cfg.BatchBytes, wire.MaxPutBatch)
 	c := &Cluster{cfg: cfg, log: cfg.Logger, ep: cfg.Endpoint, bootAddrs: map[view.NodeID][]string{}, backoff: map[view.NodeID]time.Time{}, failures: map[view.NodeID]int{}, unreach: map[view.NodeID]struct{}{}}
 	for _, m := range cfg.Ticket.Members {
 		if len(m.ID) == 32 {

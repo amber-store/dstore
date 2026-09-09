@@ -15,10 +15,13 @@ import (
 	"github.com/amber-store/dstore/wire"
 )
 
-// Batch limits (§6.2).
+// Batch limits (§6.2). Put batches are smaller than the spec's 60 MiB
+// target so that a primary holds Conns of them in flight per client
+// within one spec-sized batch of memory.
 const (
-	batchBytes = 60 << 20
-	batchKeys  = 8192
+	defaultBatchBytes = 16 << 20
+	batchBytes        = 60 << 20 // pull: bytes written to the local store at a time
+	batchKeys         = 8192
 )
 
 // MissingResult is the outcome of a negotiation.
@@ -105,7 +108,9 @@ type PutResult struct {
 type RecordSource func(k [32]byte) ([]byte, error)
 
 // Put uploads records to their primaries in byte-balanced batches, in
-// parallel across primaries (§6.2 steps 3–4). The primaries replicate.
+// parallel across primaries and, per primary, with Conns batches in
+// flight (§6.2 steps 3–4, §11.3): while a primary stores and replicates
+// one batch the next is already on the wire. The primaries replicate.
 func (c *Cluster) Put(ctx context.Context, byPrimary map[view.NodeID][][32]byte, src RecordSource, size RecordSizer, obs PutObserver) *PutResult {
 	res := &PutResult{Holders: map[[32]byte][]view.NodeID{}, Failed: map[[32]byte][]wire.KeyFailure{}, Rejected: map[[32]byte]string{}, Errors: map[view.NodeID]error{}}
 	var mu sync.Mutex
@@ -115,18 +120,33 @@ func (c *Cluster) Put(ctx context.Context, byPrimary map[view.NodeID][][32]byte,
 		wg.Add(1)
 		go func(p view.NodeID, ks [][32]byte) {
 			defer wg.Done()
-			for _, b := range batches(ks, size, batchBytes, batchKeys) {
-				sem <- struct{}{}
-				resp, err := c.putBatch(ctx, p, b, src, size, obs)
-				<-sem
+			var pwg sync.WaitGroup
+			defer pwg.Wait()
+			slots := make(chan struct{}, c.cfg.Conns)
+			for _, b := range batches(ks, size, c.cfg.BatchBytes, batchKeys) {
 				mu.Lock()
-				if err != nil {
-					res.Errors[p] = err
-					mu.Unlock()
-					return
-				}
-				res.merge(resp)
+				failed := res.Errors[p] != nil
 				mu.Unlock()
+				if failed {
+					return // the primary's remaining batches are not worth sending
+				}
+				slots <- struct{}{}
+				sem <- struct{}{}
+				pwg.Add(1)
+				go func(b [][32]byte) {
+					defer pwg.Done()
+					defer func() { <-sem; <-slots }()
+					resp, err := c.putBatch(ctx, p, b, src, size, obs)
+					mu.Lock()
+					defer mu.Unlock()
+					if err != nil {
+						if res.Errors[p] == nil {
+							res.Errors[p] = err
+						}
+						return
+					}
+					res.merge(resp)
+				}(b)
 			}
 		}(p, ks)
 	}
