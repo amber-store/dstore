@@ -46,6 +46,8 @@ func (c *Cluster) Push(ctx context.Context, local *packstore.Store, root key.Key
 	lastPin := start
 	holders := map[[32]byte][]view.NodeID{}
 	var uploaded int
+	var lastErr error
+	c.probeHinted(ctx)
 	for round := 0; round < 3; round++ {
 		mr, err := c.Missing(ctx, all, true)
 		if err != nil {
@@ -77,7 +79,10 @@ func (c *Cluster) Push(ctx context.Context, local *packstore.Store, root key.Key
 			}
 			tr.objects(n)
 			for p, err := range pr.Errors {
-				return st, fmt.Errorf("upload to %s: %w", view.ShortID(p), err)
+				// The keys stay short; the next round negotiates them at
+				// another owner, the failed one being penalised.
+				lastErr = fmt.Errorf("upload to %s: %w", view.ShortID(p), err)
+				c.log.Warn("upload to a primary failed, its objects go to another owner", "node", view.ShortID(p), "err", err)
 			}
 			for k, reason := range pr.Rejected {
 				return st, fmt.Errorf("record %x rejected: %s", k[:8], reason)
@@ -94,7 +99,11 @@ func (c *Cluster) Push(ctx context.Context, local *packstore.Store, root key.Key
 			break
 		}
 		if round == 2 {
-			return st, c.shortError(short, holders)
+			err := c.shortError(short, holders)
+			if lastErr != nil {
+				err = fmt.Errorf("%w; last upload error: %v", err, lastErr)
+			}
+			return st, err
 		}
 		// Re-put short keys to their primaries; on the last round send
 		// them to the lacking owners directly.
@@ -252,6 +261,7 @@ func (c *Cluster) Pull(ctx context.Context, local *packstore.Store, name string,
 		return st, err
 	}
 	st.Root, st.Record, st.Version = root, ref.Record, ref.Version
+	c.probeHinted(ctx)
 	if err := c.PullTree(ctx, local, root, &st, prog); err != nil {
 		return st, err
 	}

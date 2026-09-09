@@ -232,6 +232,30 @@ func (c *Cluster) penalty(id view.NodeID) int {
 	return p
 }
 
+// probeHinted checks the members a view reply flagged unreachable before
+// a transfer starts. The hint is one node's view and may be stale; an
+// owner it demoted would otherwise sit out the transfer (§11.1). A probe
+// that answers clears the hint, one that fails adds the usual backoff.
+func (c *Cluster) probeHinted(ctx context.Context) {
+	c.mu.RLock()
+	ids := make([]view.NodeID, 0, len(c.unreach))
+	for id := range c.unreach {
+		ids = append(ids, id)
+	}
+	c.mu.RUnlock()
+	var wg sync.WaitGroup
+	for _, id := range ids {
+		wg.Add(1)
+		go func(id view.NodeID) {
+			defer wg.Done()
+			pctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			_, _ = c.call(pctx, id, &wire.Msg{Type: wire.TView})
+		}(id)
+	}
+	wg.Wait()
+}
+
 // call sends one request to a node and reads one reply.
 func (c *Cluster) call(ctx context.Context, id view.NodeID, m *wire.Msg) (*wire.Msg, error) {
 	cctx, cancel := context.WithTimeout(ctx, c.cfg.RequestTimeout)

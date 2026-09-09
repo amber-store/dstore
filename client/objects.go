@@ -35,20 +35,50 @@ type MissingResult struct {
 }
 
 // Missing groups keys by primary and asks each which it lacks (§6.2 step
-// 2). With pin, present keys are pinned at every owner that confirms.
+// 2). With pin, present keys are pinned at every owner that confirms. A
+// primary that cannot be reached is skipped for its keys, which are asked
+// at their next owner: the primary is a preference, not a role.
 func (c *Cluster) Missing(ctx context.Context, keys [][32]byte, pin bool) (*MissingResult, error) {
 	res := &MissingResult{Lacking: map[view.NodeID][][32]byte{}, Holders: map[[32]byte][]view.NodeID{}, Failed: map[[32]byte]error{}}
-	byPrimary := map[view.NodeID][][32]byte{}
-	for _, k := range keys {
-		p, ok := c.Primary(k)
-		if !ok {
-			res.Failed[k] = errors.New("no owners")
-			continue
+	tried := map[[32]byte]map[view.NodeID]bool{}
+	pending := keys
+	for attempt := 0; len(pending) > 0; attempt++ {
+		byPrimary := map[view.NodeID][][32]byte{}
+		for _, k := range pending {
+			p, ok := c.primaryExcept(k, tried[k])
+			if !ok {
+				if res.Failed[k] == nil {
+					res.Failed[k] = errors.New("no owners")
+				}
+				continue
+			}
+			byPrimary[p] = append(byPrimary[p], k)
 		}
-		byPrimary[p] = append(byPrimary[p], k)
+		pending = c.askPrimaries(ctx, byPrimary, pin, res, tried)
+		if len(pending) > 0 {
+			c.log.Warn("negotiation failed at a primary, asking the next owner", "objects", len(pending), "attempt", attempt+1)
+		}
 	}
+	return res, nil
+}
+
+// primaryExcept is the preferred owner of key among those not excluded.
+func (c *Cluster) primaryExcept(key [32]byte, exclude map[view.NodeID]bool) (view.NodeID, bool) {
+	for _, o := range c.preferred(c.Placement().Owners(key)) {
+		if !exclude[o] {
+			return o, true
+		}
+	}
+	return view.NodeID{}, false
+}
+
+// askPrimaries runs one negotiation round and returns the keys whose
+// primary could not be reached; a primary that answered with an error
+// fails its keys outright.
+func (c *Cluster) askPrimaries(ctx context.Context, byPrimary map[view.NodeID][][32]byte, pin bool, res *MissingResult, tried map[[32]byte]map[view.NodeID]bool) [][32]byte {
 	var mu sync.Mutex
 	var wg sync.WaitGroup
+	var retry [][32]byte
 	sem := make(chan struct{}, c.cfg.Jobs)
 	for p, ks := range byPrimary {
 		for i := 0; i < len(ks); i += batchKeys {
@@ -62,8 +92,18 @@ func (c *Cluster) Missing(ctx context.Context, keys [][32]byte, pin bool) (*Miss
 				mu.Lock()
 				defer mu.Unlock()
 				if err != nil {
+					_, answered := wire.AsError(err)
 					for _, k := range ks {
+						if answered || ctx.Err() != nil {
+							res.Failed[k] = err
+							continue
+						}
+						if tried[k] == nil {
+							tried[k] = map[view.NodeID]bool{}
+						}
+						tried[k][p] = true
 						res.Failed[k] = err
+						retry = append(retry, k)
 					}
 					return
 				}
@@ -79,6 +119,7 @@ func (c *Cluster) Missing(ctx context.Context, keys [][32]byte, pin bool) (*Miss
 					}
 				}
 				for _, k := range ks {
+					delete(res.Failed, k)
 					if _, l := lack[k]; l {
 						res.Lacking[p] = append(res.Lacking[p], k)
 						continue
@@ -93,7 +134,7 @@ func (c *Cluster) Missing(ctx context.Context, keys [][32]byte, pin bool) (*Miss
 		}
 	}
 	wg.Wait()
-	return res, nil
+	return retry
 }
 
 // PutResult is the outcome of an upload.
