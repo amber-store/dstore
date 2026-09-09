@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/amber-store/core/key"
 	"github.com/amber-store/dstore/view"
 	"github.com/amber-store/dstore/wire"
 )
@@ -135,12 +134,12 @@ func (t *tracker) snapshot() ProgressReport {
 	return rep
 }
 
-// countKeys sums the objects and bytes of a per-node key map.
-func countKeys(m map[view.NodeID][][32]byte) (objects int, bytes int64) {
+// countKeys sums the objects and wire bytes of a per-node key map.
+func countKeys(m map[view.NodeID][][32]byte, size RecordSizer) (objects int, bytes int64) {
 	for _, ks := range m {
 		objects += len(ks)
 		for _, k := range ks {
-			bytes += int64(key.Key(k).Length())
+			bytes += int64(size(k))
 		}
 	}
 	return objects, bytes

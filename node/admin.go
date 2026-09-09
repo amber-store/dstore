@@ -273,7 +273,8 @@ func (n *Node) broadcastCluster(ctx context.Context, m *wire.Msg) {
 		go func(id view.NodeID) {
 			cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
-			_, _ = n.pool.Call(cctx, id, wire.ALPNCluster, n.stampReq(m))
+			req := *m // stamped and encoded per goroutine
+			_, _ = n.pool.Call(cctx, id, wire.ALPNCluster, n.stampReq(&req))
 		}(id)
 	}
 }

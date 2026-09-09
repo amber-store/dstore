@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"iter"
 	"sync"
 	"time"
@@ -15,10 +14,12 @@ import (
 	"github.com/amber-store/dstore/wire"
 )
 
-// Batch limits (§6.2).
+// Batch limits (§6.2). Put batches are smaller than the spec's 60 MiB
+// target so that a primary holds Conns of them in flight per client
+// within one spec-sized batch of memory.
 const (
-	batchBytes = 60 << 20
-	batchKeys  = 8192
+	defaultBatchBytes = 16 << 20
+	batchKeys         = 8192
 )
 
 // MissingResult is the outcome of a negotiation.
@@ -32,20 +33,50 @@ type MissingResult struct {
 }
 
 // Missing groups keys by primary and asks each which it lacks (§6.2 step
-// 2). With pin, present keys are pinned at every owner that confirms.
+// 2). With pin, present keys are pinned at every owner that confirms. A
+// primary that cannot be reached is skipped for its keys, which are asked
+// at their next owner: the primary is a preference, not a role.
 func (c *Cluster) Missing(ctx context.Context, keys [][32]byte, pin bool) (*MissingResult, error) {
 	res := &MissingResult{Lacking: map[view.NodeID][][32]byte{}, Holders: map[[32]byte][]view.NodeID{}, Failed: map[[32]byte]error{}}
-	byPrimary := map[view.NodeID][][32]byte{}
-	for _, k := range keys {
-		p, ok := c.Primary(k)
-		if !ok {
-			res.Failed[k] = errors.New("no owners")
-			continue
+	tried := map[[32]byte]map[view.NodeID]bool{}
+	pending := keys
+	for attempt := 0; len(pending) > 0; attempt++ {
+		byPrimary := map[view.NodeID][][32]byte{}
+		for _, k := range pending {
+			p, ok := c.primaryExcept(k, tried[k])
+			if !ok {
+				if res.Failed[k] == nil {
+					res.Failed[k] = errors.New("no owners")
+				}
+				continue
+			}
+			byPrimary[p] = append(byPrimary[p], k)
 		}
-		byPrimary[p] = append(byPrimary[p], k)
+		pending = c.askPrimaries(ctx, byPrimary, pin, res, tried)
+		if len(pending) > 0 {
+			c.log.Warn("negotiation failed at a primary, asking the next owner", "objects", len(pending), "attempt", attempt+1)
+		}
 	}
+	return res, nil
+}
+
+// primaryExcept is the preferred owner of key among those not excluded.
+func (c *Cluster) primaryExcept(key [32]byte, exclude map[view.NodeID]bool) (view.NodeID, bool) {
+	for _, o := range c.preferred(c.Placement().Owners(key)) {
+		if !exclude[o] {
+			return o, true
+		}
+	}
+	return view.NodeID{}, false
+}
+
+// askPrimaries runs one negotiation round and returns the keys whose
+// primary could not be reached; a primary that answered with an error
+// fails its keys outright.
+func (c *Cluster) askPrimaries(ctx context.Context, byPrimary map[view.NodeID][][32]byte, pin bool, res *MissingResult, tried map[[32]byte]map[view.NodeID]bool) [][32]byte {
 	var mu sync.Mutex
 	var wg sync.WaitGroup
+	var retry [][32]byte
 	sem := make(chan struct{}, c.cfg.Jobs)
 	for p, ks := range byPrimary {
 		for i := 0; i < len(ks); i += batchKeys {
@@ -59,8 +90,18 @@ func (c *Cluster) Missing(ctx context.Context, keys [][32]byte, pin bool) (*Miss
 				mu.Lock()
 				defer mu.Unlock()
 				if err != nil {
+					_, answered := wire.AsError(err)
 					for _, k := range ks {
+						if answered || ctx.Err() != nil {
+							res.Failed[k] = err
+							continue
+						}
+						if tried[k] == nil {
+							tried[k] = map[view.NodeID]bool{}
+						}
+						tried[k][p] = true
 						res.Failed[k] = err
+						retry = append(retry, k)
 					}
 					return
 				}
@@ -76,6 +117,7 @@ func (c *Cluster) Missing(ctx context.Context, keys [][32]byte, pin bool) (*Miss
 					}
 				}
 				for _, k := range ks {
+					delete(res.Failed, k)
 					if _, l := lack[k]; l {
 						res.Lacking[p] = append(res.Lacking[p], k)
 						continue
@@ -90,7 +132,7 @@ func (c *Cluster) Missing(ctx context.Context, keys [][32]byte, pin bool) (*Miss
 		}
 	}
 	wg.Wait()
-	return res, nil
+	return retry
 }
 
 // PutResult is the outcome of an upload.
@@ -105,8 +147,10 @@ type PutResult struct {
 type RecordSource func(k [32]byte) ([]byte, error)
 
 // Put uploads records to their primaries in byte-balanced batches, in
-// parallel across primaries (§6.2 steps 3–4). The primaries replicate.
-func (c *Cluster) Put(ctx context.Context, byPrimary map[view.NodeID][][32]byte, src RecordSource, obs PutObserver) *PutResult {
+// parallel across primaries and, per primary, with Conns batches in
+// flight (§6.2 steps 3–4, §11.3): while a primary stores and replicates
+// one batch the next is already on the wire. The primaries replicate.
+func (c *Cluster) Put(ctx context.Context, byPrimary map[view.NodeID][][32]byte, src RecordSource, size RecordSizer, obs PutObserver) *PutResult {
 	res := &PutResult{Holders: map[[32]byte][]view.NodeID{}, Failed: map[[32]byte][]wire.KeyFailure{}, Rejected: map[[32]byte]string{}, Errors: map[view.NodeID]error{}}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -115,60 +159,64 @@ func (c *Cluster) Put(ctx context.Context, byPrimary map[view.NodeID][][32]byte,
 		wg.Add(1)
 		go func(p view.NodeID, ks [][32]byte) {
 			defer wg.Done()
-			// Byte-balanced batches.
-			var batch [][32]byte
-			var size int
-			flush := func() {
-				if len(batch) == 0 {
-					return
-				}
-				sem <- struct{}{}
-				b := batch
-				batch, size = nil, 0
-				resp, err := c.putBatch(ctx, p, b, src, obs)
-				<-sem
+			var pwg sync.WaitGroup
+			defer pwg.Wait()
+			slots := make(chan struct{}, c.cfg.Conns)
+			for _, b := range batches(ks, size, c.cfg.BatchBytes, batchKeys) {
 				mu.Lock()
-				defer mu.Unlock()
-				if err != nil {
-					res.Errors[p] = err
-					return
+				failed := res.Errors[p] != nil
+				mu.Unlock()
+				if failed {
+					return // the primary's remaining batches are not worth sending
 				}
-				for _, h := range resp.Holders {
-					if len(h.Key) == 32 {
-						res.Holders[[32]byte(h.Key)] = view.IDsOf(h.Holders)
+				slots <- struct{}{}
+				sem <- struct{}{}
+				pwg.Add(1)
+				go func(b [][32]byte) {
+					defer pwg.Done()
+					defer func() { <-sem; <-slots }()
+					resp, err := c.putBatch(ctx, p, b, src, size, obs)
+					mu.Lock()
+					defer mu.Unlock()
+					if err != nil {
+						if res.Errors[p] == nil {
+							res.Errors[p] = err
+						}
+						return
 					}
-				}
-				for _, f := range resp.Failed {
-					if len(f.Key) == 32 {
-						res.Failed[[32]byte(f.Key)] = append(res.Failed[[32]byte(f.Key)], f)
-					}
-				}
-				for _, r := range resp.Rejected {
-					if len(r.Key) == 32 {
-						res.Rejected[[32]byte(r.Key)] = r.Reason
-					}
-				}
+					res.merge(resp)
+				}(b)
 			}
-			for _, k := range ks {
-				n := int(key.Key(k).Length())
-				if len(batch) > 0 && (size+n > batchBytes || len(batch) >= batchKeys) {
-					flush()
-				}
-				batch = append(batch, k)
-				size += n
-			}
-			flush()
 		}(p, ks)
 	}
 	wg.Wait()
 	return res
 }
 
+// merge folds one batch reply into the result; the caller holds the lock.
+func (r *PutResult) merge(resp *wire.Msg) {
+	for _, h := range resp.Holders {
+		if len(h.Key) == 32 {
+			r.Holders[[32]byte(h.Key)] = view.IDsOf(h.Holders)
+		}
+	}
+	for _, f := range resp.Failed {
+		if len(f.Key) == 32 {
+			r.Failed[[32]byte(f.Key)] = append(r.Failed[[32]byte(f.Key)], f)
+		}
+	}
+	for _, rj := range resp.Rejected {
+		if len(rj.Key) == 32 {
+			r.Rejected[[32]byte(rj.Key)] = rj.Reason
+		}
+	}
+}
+
 // putBatch streams one batch to a primary.
-func (c *Cluster) putBatch(ctx context.Context, p view.NodeID, keys [][32]byte, src RecordSource, obs PutObserver) (*wire.Msg, error) {
+func (c *Cluster) putBatch(ctx context.Context, p view.NodeID, keys [][32]byte, src RecordSource, size RecordSizer, obs PutObserver) (*wire.Msg, error) {
 	var last error
 	for attempt := 0; attempt < 4; attempt++ {
-		resp, err := c.putOnce(ctx, p, keys, src, obs)
+		resp, err := c.putOnce(ctx, p, keys, src, size, obs)
 		if err == nil {
 			return resp, nil
 		}
@@ -193,12 +241,12 @@ func (c *Cluster) putBatch(ctx context.Context, p view.NodeID, keys [][32]byte, 
 	return nil, last
 }
 
-func (c *Cluster) putOnce(ctx context.Context, p view.NodeID, keys [][32]byte, src RecordSource, obs PutObserver) (*wire.Msg, error) {
+func (c *Cluster) putOnce(ctx context.Context, p view.NodeID, keys [][32]byte, src RecordSource, size RecordSizer, obs PutObserver) (*wire.Msg, error) {
 	cctx, cancel := context.WithTimeout(ctx, 10*c.cfg.RequestTimeout)
 	defer cancel()
 	var total int64
 	for _, k := range keys {
-		total += int64(key.Key(k).Length())
+		total += int64(size(k))
 	}
 	if obs.Start != nil {
 		obs.Start(p)
@@ -228,7 +276,7 @@ func (c *Cluster) putOnce(ctx context.Context, p view.NodeID, keys [][32]byte, s
 				return
 			}
 			if obs.Sent != nil {
-				obs.Sent(p, int(key.Key(k).Length()))
+				obs.Sent(p, len(rec))
 			}
 		}
 	})
@@ -286,134 +334,44 @@ type GetResult struct {
 	Record []byte
 }
 
-// Get fetches records, grouping keys by preferred owner and re-asking
-// down the read order (§6.3). It yields every record found; keys not
+// Get fetches records, streaming each as it is verified; keys are batched
+// by preferred owner and re-asked down the read order (§6.3). Keys not
 // found anywhere are returned in missing.
 func (c *Cluster) Get(ctx context.Context, keys [][32]byte) (iter.Seq2[GetResult, error], func() [][32]byte) {
 	var missing [][32]byte
 	var mmu sync.Mutex
 	seq := func(yield func(GetResult, error) bool) {
-		remaining := map[[32]byte]int{} // key → index into its read order
-		for _, k := range keys {
-			remaining[k] = 0
-		}
-		refreshed := false
-		for len(remaining) > 0 {
-			byNode := map[view.NodeID][][32]byte{}
-			var exhausted [][32]byte
-			for k, idx := range remaining {
-				order := c.ReadOrder(k)
-				if idx >= len(order) {
-					exhausted = append(exhausted, k)
+		f := c.newFetcher(ctx)
+		defer f.stop()
+		go func() {
+			seen := make(map[[32]byte]struct{}, len(keys))
+			for _, k := range keys {
+				if _, dup := seen[k]; dup {
 					continue
 				}
-				byNode[order[idx]] = append(byNode[order[idx]], k)
+				seen[k] = struct{}{}
+				if !f.add(k) {
+					return
+				}
 			}
-			if len(exhausted) > 0 {
-				if !refreshed {
-					// A miss at every owner is the signature of a stale view.
-					refreshed = true
-					_ = c.RefreshView(ctx)
-					for _, k := range exhausted {
-						remaining[k] = 0
-					}
-					continue
-				}
+			f.finish()
+		}()
+		for r := range f.results() {
+			if r.rec == nil {
 				mmu.Lock()
-				missing = append(missing, exhausted...)
+				missing = append(missing, r.key)
 				mmu.Unlock()
-				for _, k := range exhausted {
-					delete(remaining, k)
-				}
-				if len(byNode) == 0 {
-					break
-				}
+				continue
 			}
-			type fetched struct {
-				recs map[[32]byte][]byte
-				keys [][32]byte
-				err  error
-			}
-			results := make(chan fetched, len(byNode))
-			var wg sync.WaitGroup
-			sem := make(chan struct{}, c.cfg.Jobs)
-			for id, ks := range byNode {
-				wg.Add(1)
-				go func(id view.NodeID, ks [][32]byte) {
-					defer wg.Done()
-					sem <- struct{}{}
-					defer func() { <-sem }()
-					recs, err := c.getFrom(ctx, id, ks)
-					results <- fetched{recs, ks, err}
-				}(id, ks)
-			}
-			wg.Wait()
-			close(results)
-			for f := range results {
-				for _, k := range f.keys {
-					if rec, ok := f.recs[k]; ok {
-						delete(remaining, k)
-						if !yield(GetResult{Key: k, Record: rec}, nil) {
-							return
-						}
-					} else {
-						remaining[k]++
-					}
-				}
-			}
-			if ctx.Err() != nil {
-				yield(GetResult{}, ctx.Err())
+			if !yield(GetResult{Key: r.key, Record: r.rec}, nil) {
 				return
 			}
 		}
+		if err := ctx.Err(); err != nil {
+			yield(GetResult{}, err)
+		}
 	}
 	return seq, func() [][32]byte { mmu.Lock(); defer mmu.Unlock(); return missing }
-}
-
-// getFrom fetches a batch from one node, verifying every record.
-func (c *Cluster) getFrom(ctx context.Context, id view.NodeID, keys [][32]byte) (map[[32]byte][]byte, error) {
-	out := map[[32]byte][]byte{}
-	for i := 0; i < len(keys); i += batchKeys {
-		end := min(i+batchKeys, len(keys))
-		if err := c.getBatch(ctx, id, keys[i:end], out); err != nil {
-			return out, err
-		}
-	}
-	return out, nil
-}
-
-func (c *Cluster) getBatch(ctx context.Context, id view.NodeID, keys [][32]byte, out map[[32]byte][]byte) error {
-	cctx, cancel := context.WithTimeout(ctx, 10*c.cfg.RequestTimeout)
-	defer cancel()
-	s, err := c.pool.Open(cctx, id, wire.ALPNClient)
-	if err != nil {
-		c.handleErr(id, err)
-		return err
-	}
-	defer wire.CloseStream(s)
-	if err := wire.WriteMsg(s, c.stamp(&wire.Msg{Type: wire.TGet, Keys: wire.RawKeys(keys)})); err != nil {
-		return err
-	}
-	_ = s.CloseWrite()
-	if _, err := wire.Expect(s, wire.TAbsent); err != nil {
-		c.handleErr(id, err)
-		return err
-	}
-	pr := wire.NewPackReader(s)
-	reader := amberpack.NewReader(pr)
-	for raw, err := range reader.Records() {
-		if err != nil {
-			return err
-		}
-		k, rec, err := VerifyRecord(raw)
-		if err != nil {
-			continue // a corrupt copy: the next owner is asked
-		}
-		out[k] = rec
-	}
-	_, _ = io.Copy(io.Discard, pr)
-	c.ok(id)
-	return nil
 }
 
 // VerifyRecord parses and verifies one wire record against its key.

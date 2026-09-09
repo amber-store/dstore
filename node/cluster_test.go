@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/amber-store/core/amberpack"
 	"github.com/amber-store/core/fstree"
 	"github.com/amber-store/core/ingest"
 	"github.com/amber-store/core/key"
@@ -38,6 +40,7 @@ type harness struct {
 	nodes []*node.Node
 	dirs  []string
 	log   *slog.Logger
+	tweak func(*node.Config) // adjusts every node's config
 }
 
 func testLogger(t *testing.T) *slog.Logger {
@@ -54,14 +57,18 @@ func newHarness(t *testing.T) *harness {
 
 func (h *harness) config(i byte, dir string) node.Config {
 	ep := h.net.Bind(nid(i), wire.ALPNClient, wire.ALPNCluster)
-	return node.Config{
+	cfg := node.Config{
 		StoreDir: dir, Endpoint: ep, Logger: h.log, NoSync: true, SegmentSize: 256 << 10,
 		MaintenanceTick: 200 * time.Millisecond, Lease: 3 * time.Second, ViewRefresh: time.Second,
 		AdoptTimeout: 3 * time.Second, ParticipantTimeout: 30 * time.Second, Delta: 2 * time.Second,
 		FirstAudit: 500 * time.Millisecond, GCInterval: 2 * time.Second, BarrierTimeout: 5 * time.Second,
 		MarkTimeout: 30 * time.Second, SweepTimeout: 30 * time.Second, Grace: time.Millisecond,
-		ForwardTimeout: 10 * time.Second, PutTTL: 10 * time.Minute,
+		ForwardTimeout: 10 * time.Second, PutTTL: 10 * time.Minute, PutChunkBytes: 256 << 10,
 	}
+	if h.tweak != nil {
+		h.tweak(&cfg)
+	}
+	return cfg
 }
 
 func (h *harness) open(i byte) *node.Node {
@@ -121,8 +128,12 @@ func (h *harness) waitSteady(nodes int, voters int) {
 }
 
 // cluster3 builds a three-node cluster: init on node 1, join 2 and 3.
-func cluster3(t *testing.T) *harness {
+func cluster3(t *testing.T) *harness { return cluster3With(t, nil) }
+
+// cluster3With is cluster3 with every node's config adjusted by tweak.
+func cluster3With(t *testing.T, tweak func(*node.Config)) *harness {
 	h := newHarness(t)
+	h.tweak = tweak
 	ctx := context.Background()
 	n1 := h.open(1)
 	if _, err := n1.InitCluster(ctx, 3, 2, 100, "", false); err != nil {
@@ -148,11 +159,20 @@ func cluster3(t *testing.T) *harness {
 }
 
 func (h *harness) client(t *testing.T, i byte) *client.Cluster {
+	return h.clientWith(t, i, nil)
+}
+
+// clientWith dials a client whose config tweak has adjusted.
+func (h *harness) clientWith(t *testing.T, i byte, tweak func(*client.Config)) *client.Cluster {
 	ep := h.net.Bind(nid(i), wire.ALPNClient)
 	n1 := h.nodes[0]
 	id1 := n1.ID()
 	tk := ticket.Ticket{Members: []ticket.Member{{ID: id1[:], Addrs: n1.Endpoint().Addrs()}}}
-	c, err := client.Dial(context.Background(), client.Config{Endpoint: ep, Ticket: tk, Logger: h.log, RequestTimeout: 20 * time.Second})
+	cfg := client.Config{Endpoint: ep, Ticket: tk, Logger: h.log, RequestTimeout: 20 * time.Second}
+	if tweak != nil {
+		tweak(&cfg)
+	}
+	c, err := client.Dial(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -470,6 +490,20 @@ func TestClusterPushProgress(t *testing.T) {
 	if last.Objects != last.TotalObjects || last.Bytes != last.TotalBytes || last.TotalBytes != st.Bytes || st.Bytes == 0 {
 		t.Fatalf("final report %+v, stats %+v", last, st)
 	}
+	// Bytes count what went over the wire: the records, not the logical
+	// lengths in the keys (a tree object's key carries its subtree's size).
+	keys, _ := fstree.ReachableKeys(root, local.Get)
+	var wire int64
+	for _, k := range keys {
+		rec, err := local.GetRecord(k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wire += int64(len(rec))
+	}
+	if st.Bytes != wire {
+		t.Fatalf("push stats count %d bytes, the records are %d bytes", st.Bytes, wire)
+	}
 	var sum int64
 	for _, n := range last.Nodes {
 		sum += n.Bytes
@@ -479,5 +513,319 @@ func TestClusterPushProgress(t *testing.T) {
 	}
 	if len(last.Nodes) == 0 || sum != last.Bytes {
 		t.Fatalf("node bytes %d over %d nodes, want %d", sum, len(last.Nodes), last.Bytes)
+	}
+	// The push spread over every owner: with R = 3 on three nodes each node
+	// is the primary for a share of the keys (§11.1), not only the node the
+	// client dialed first.
+	if len(last.Nodes) != len(h.nodes) {
+		t.Fatalf("push talked to %d of %d nodes", len(last.Nodes), len(h.nodes))
+	}
+	for _, n := range last.Nodes {
+		if n.Bytes == 0 {
+			t.Fatalf("node %s received nothing", view.ShortID(n.ID))
+		}
+	}
+}
+
+// TestClusterPushPipelines checks that a push keeps several batches in
+// flight per primary, so that the wait for one batch's store and
+// replication overlaps the next batch's transfer.
+func TestClusterPushPipelines(t *testing.T) {
+	h := cluster3(t)
+	defer h.close()
+	ctx := context.Background()
+	c := h.clientWith(t, 100, func(cfg *client.Config) { cfg.BatchBytes = 64 << 10 })
+	defer c.Close()
+
+	local, root, _ := makeTree(t, 30, 20000)
+	maxInFlight := 0 // prog runs under the transfer's lock
+	prog := func(r client.ProgressReport) {
+		for _, n := range r.Nodes {
+			maxInFlight = max(maxInFlight, n.InFlight)
+		}
+	}
+	if _, err := c.Push(ctx, local, root, "trees/pipe", "tester", client.Cond{Force: true}, prog); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if maxInFlight < 2 {
+		t.Fatalf("at most %d batch in flight per node: batches are not pipelined", maxInFlight)
+	}
+}
+
+// TestClusterPutStreamsWhileReceiving drives one put stream by hand and
+// requires a replica to hold the batch's first record while the second
+// half of the batch is still being sent: the primary appends and forwards
+// records as they arrive instead of after the whole batch is in.
+func TestClusterPutStreamsWhileReceiving(t *testing.T) {
+	h := cluster3(t)
+	defer h.close()
+	ctx := context.Background()
+	n1, n2 := h.nodes[0], h.nodes[1]
+	ep := h.net.Bind(nid(100), wire.ALPNClient)
+	pool := transport.NewPool(ep, func(view.NodeID) []string { return n1.Endpoint().Addrs() }, 1)
+	defer pool.Close()
+
+	// 64 blobs of 64 KiB: the first half fills two 1 MiB wire frames.
+	var recs [][]byte
+	var first key.Key
+	for i := 0; i < 64; i++ {
+		data := make([]byte, 64<<10)
+		rand.Read(data)
+		k, err := key.New(key.Blob, uint64(len(data)), data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec, err := amberpack.EncodeRecord(k, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			first = k
+		}
+		recs = append(recs, rec)
+	}
+	s, err := pool.Open(ctx, n1.ID(), wire.ALPNClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wire.CloseStream(s)
+	v := n1.View()
+	if err := wire.WriteMsg(s, &wire.Msg{Type: wire.TPut, ClusterID: v.ClusterID, Incarnation: v.Incarnation, Epoch: v.Epoch}); err != nil {
+		t.Fatal(err)
+	}
+	var midway error
+	err = wire.SendPackRecords(s, func(yield func([]byte, error) bool) {
+		for i, rec := range recs {
+			if i == len(recs)/2 {
+				deadline := time.Now().Add(10 * time.Second)
+				for {
+					if has, _ := n2.Store().Has(first); has {
+						break
+					}
+					if time.Now().After(deadline) {
+						midway = errors.New("the replica did not hold the first record while the batch was still being sent")
+						break
+					}
+					time.Sleep(20 * time.Millisecond)
+				}
+			}
+			if !yield(rec, nil) {
+				return
+			}
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = s.CloseWrite()
+	resp, err := wire.Expect(s, wire.TPutResult)
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if midway != nil {
+		t.Fatal(midway)
+	}
+	if len(resp.Holders) != len(recs) || len(resp.Failed) != 0 || len(resp.Rejected) != 0 {
+		t.Fatalf("reply: %d holders, %d failed, %d rejected", len(resp.Holders), len(resp.Failed), len(resp.Rejected))
+	}
+	for _, hl := range resp.Holders {
+		if len(hl.Holders) != 3 {
+			t.Fatalf("key %x held by %d owners, want 3", hl.Key[:8], len(hl.Holders))
+		}
+	}
+}
+
+// pushTree pushes a fresh random tree and returns its local store, root
+// and keys.
+func pushTree(t *testing.T, c *client.Cluster, files, size int, name string) (*packstore.Store, key.Key, [][32]byte) {
+	t.Helper()
+	local, root, _ := makeTree(t, files, size)
+	if _, err := c.Push(context.Background(), local, root, name, "tester", client.Cond{Force: true}, nil); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	keys, err := fstree.ReachableKeys(root, local.Get)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := make([][32]byte, len(keys))
+	for i, k := range keys {
+		all[i] = [32]byte(k)
+	}
+	return local, root, all
+}
+
+// TestClusterGetYieldsBeforeEveryBatchIsFetched checks that Get streams:
+// with one worker and a dial latency, the first record must arrive after
+// one latency, not after every per-node batch has completed.
+func TestClusterGetYieldsBeforeEveryBatchIsFetched(t *testing.T) {
+	h := cluster3(t)
+	defer h.close()
+	ctx := context.Background()
+	c := h.clientWith(t, 100, func(cfg *client.Config) { cfg.Jobs = 1 })
+	defer c.Close()
+	_, _, keys := pushTree(t, c, 30, 20000, "trees/get")
+
+	const delay = 300 * time.Millisecond
+	h.net.SetDelay(delay)
+	defer h.net.SetDelay(0)
+	start := time.Now()
+	seq, _ := c.Get(ctx, keys)
+	var first time.Duration
+	for _, err := range seq {
+		if err != nil {
+			t.Fatal(err)
+		}
+		first = time.Since(start)
+		break
+	}
+	if first == 0 || first >= 2*delay {
+		t.Fatalf("first record after %v with a %v dial latency: Get waited for every batch", first, delay)
+	}
+}
+
+// TestClusterGetStopsEarlyCleanly breaks out of a Get and then uses the
+// client again: the fetch's goroutines must not leak or deadlock.
+func TestClusterGetStopsEarlyCleanly(t *testing.T) {
+	h := cluster3(t)
+	defer h.close()
+	ctx := context.Background()
+	c := h.client(t, 100)
+	_, _, keys := pushTree(t, c, 30, 20000, "trees/early")
+
+	for round := 0; round < 3; round++ {
+		seq, _ := c.Get(ctx, keys)
+		n := 0
+		for _, err := range seq {
+			if err != nil {
+				t.Fatal(err)
+			}
+			n++
+			if n == 2 {
+				break
+			}
+		}
+		if n != 2 {
+			t.Fatalf("round %d: got %d records before breaking", round, n)
+		}
+	}
+	seq, missing := c.Get(ctx, keys)
+	n := 0
+	for _, err := range seq {
+		if err != nil {
+			t.Fatal(err)
+		}
+		n++
+	}
+	if n != len(keys) || len(missing()) != 0 {
+		t.Fatalf("full get after early breaks: %d of %d records, %d missing", n, len(keys), len(missing()))
+	}
+	done := make(chan struct{})
+	go func() { c.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close hung after early breaks")
+	}
+}
+
+// TestClusterPullWithNodeDown pulls a tree with one owner down: every key
+// is served by its next owner in the read order.
+func TestClusterPullWithNodeDown(t *testing.T) {
+	h := cluster3(t)
+	defer h.close()
+	ctx := context.Background()
+	c := h.client(t, 100)
+	defer c.Close()
+	local, root, keys := pushTree(t, c, 30, 20000, "trees/down")
+
+	h.net.SetDown(nid(2), true)
+	defer h.net.SetDown(nid(2), false)
+	pulled, err := packstore.Open(filepath.Join(t.TempDir(), "pulled"), packstore.WithSync(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pulled.Close()
+	ps, err := c.Pull(ctx, pulled, "trees/down", nil)
+	if err != nil {
+		t.Fatalf("pull with a node down: %v", err)
+	}
+	if ps.Root != root || ps.Fetched != len(keys) {
+		t.Fatalf("pulled root %s, %d of %d objects", ps.Root, ps.Fetched, len(keys))
+	}
+	for _, k := range keys {
+		a, _ := local.Get(key.Key(k))
+		b, err := pulled.Get(key.Key(k))
+		if err != nil || !bytes.Equal(a, b) {
+			t.Fatalf("object %x missing or different after pull", k[:8])
+		}
+	}
+}
+
+// TestClusterPutGivesUpASlowForward checks that a put does not wait for
+// a forward whose owner takes longer than the forward timeout to reach:
+// the key fails for this batch and the reply comes back at once.
+func TestClusterPutGivesUpASlowForward(t *testing.T) {
+	h := cluster3With(t, func(c *node.Config) { c.ForwardTimeout = time.Second })
+	defer h.close()
+	ctx := context.Background()
+	n1 := h.nodes[0]
+	ep := h.net.Bind(nid(100), wire.ALPNClient)
+	pool := transport.NewPool(ep, func(view.NodeID) []string { return n1.Endpoint().Addrs() }, 1)
+	defer pool.Close()
+
+	var recs [][]byte
+	for i := 0; i < 200; i++ {
+		data := make([]byte, 16<<10)
+		rand.Read(data)
+		k, err := key.New(key.Blob, uint64(len(data)), data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec, err := amberpack.EncodeRecord(k, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		recs = append(recs, rec)
+	}
+	s, err := pool.Open(ctx, n1.ID(), wire.ALPNClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wire.CloseStream(s)
+	// Every dial from here on takes far longer than the forward timeout,
+	// and the primary's connections to the other owners are dropped so
+	// that its forwards have to dial.
+	h.net.SetDelay(5 * time.Second)
+	defer h.net.SetDelay(0)
+	for _, i := range []byte{2, 3} {
+		h.net.SetDown(nid(i), true)
+		h.net.SetDown(nid(i), false)
+	}
+	v := n1.View()
+	if err := wire.WriteMsg(s, &wire.Msg{Type: wire.TPut, ClusterID: v.ClusterID, Incarnation: v.Incarnation, Epoch: v.Epoch}); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	err = wire.SendPackRecords(s, func(yield func([]byte, error) bool) {
+		for _, rec := range recs {
+			if !yield(rec, nil) {
+				return
+			}
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = s.CloseWrite()
+	resp, err := wire.Expect(s, wire.TPutResult)
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	took := time.Since(start)
+	if took >= 4*time.Second {
+		t.Fatalf("put took %v: it waited for forwards slower than the 1 s forward timeout", took)
+	}
+	if len(resp.Holders) != len(recs) || len(resp.Failed) == 0 {
+		t.Fatalf("reply: %d holders, %d failed; the slow owners should have failed", len(resp.Holders), len(resp.Failed))
 	}
 }

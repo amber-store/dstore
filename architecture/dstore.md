@@ -707,10 +707,12 @@ gateway node on a legacy client's behalf):
    below `R`) — the primary negotiates them with the other owners before
    answering, key lists only, bounded by `(R−1) × 32 B` per key;
 3. uploads those records to the primary as byte-balanced amberpack
-   batches (target 60 MiB, ≤ 8192 keys) over `put {epoch}`, in parallel
-   across primaries — a tree's keys have primaries spread over the whole
-   cluster, so a LAN client still talks to many nodes at once — and, for
-   throughput, across sharded connections (§11.3); records travel
+   batches (16 MiB by the records' stored sizes, ≤ 8192 keys) over
+   `put {epoch}`, in parallel across primaries — a tree's keys have
+   primaries spread over the whole cluster, so a LAN client still talks
+   to many nodes at once — and, per primary, with `Conns` batches in
+   flight over the pooled connections (§11.3), so that one batch's store
+   and replication overlap the next batch's transfer; records travel
    verbatim from the sender's packstore (`GetRecord`), no re-encoding;
 4. reads each batch's reply: per key, the owners that now hold it
    (`holders[]`) and any owner that did not (`failed [{node, reason,
@@ -718,19 +720,20 @@ gateway node on a legacy client's behalf):
    plus `rejected[]` (hash mismatch, malformed — the node verifies each
    record itself and skips a bad one rather than aborting the batch),
    `no-space`, or `busy` with a jittered retry hint (a node admits a
-   bounded number of concurrent write streams, default 2× cores, and a
-   byte budget, with a share reserved for cluster-ALPN writes — forwards
-   and reconcile — so client streams cannot starve replication; excess
-   streams are simply not read until a slot frees, QUIC flow control
-   holding the sender back);
+   bounded number of concurrent write streams per ALPN, default 2× cores
+   each, the cluster-ALPN pool serving forwards and reconcile so client
+   streams cannot starve replication; excess streams are simply not read
+   until a slot frees, QUIC flow control holding the sender back);
 5. applies the ack policy below to the holders. Any owner — primary or
    replica — that keeps answering `busy` past `busy_deadline` (default
    5 min) counts as unreachable; a key short at a replica is re-put to
    the primary (which re-forwards; dedup makes it cheap) or, if the
    primary's forwards keep failing, sent by the client to the lacking
    owner directly — any owner accepts a client `put` for a key it owns,
-   the primary is a preference, not a role. The push fails naming the
-   owners that did not confirm only when no owner will take a key.
+   the primary is a preference, not a role, and a primary the client
+   cannot reach is skipped for its keys, which go to their next owner.
+   The push fails naming the owners that did not confirm only when no
+   owner will take a key.
 
 **What the primary does.** On a client-ALPN `missing`, besides
 answering what it lacks, it negotiates the keys it *holds* with the
@@ -747,16 +750,17 @@ cluster ALPN — the reference gate's, the reconcile pass's — is a plain
 presence check, so audits never cascade node to node, and a client is
 rate-limited in the audits it can trigger as it is in `ref-list`. On `put`, it accepts a record only if its epoch matches and
 the key is one it owns under `nodes ∪ pending.nodes` (else `not-owner`,
-with the view) and it has space; it verifies the payload against the key
-(`WriteParallel`, the same gate core's daemon uses), appends it durably,
-forwards it to the other owners over the cluster ALPN (`missing` then
-`put` there; a replica applies the same verification and pins dedup hits
-the same way), and answers the batch with each key's holders once its own
-append is synced and every forward has been confirmed or failed.
-Forwarding is synchronous and bounded: per-target queues are small, the
-forward timeout (seconds) is far below the client's batch deadline so
-one slow replica cannot convoy every primary's batches, a replica that
-does not answer in time fails the key *for this batch* and the reply
+with the view) and it has space; it verifies each record against its key
+as it arrives, appends the records in chunks (`WriteParallel`, the same
+gate core's daemon uses) and streams them to the other owners' `put`
+over the cluster ALPN while the batch is still arriving (a replica
+applies the same verification and pins dedup hits the same way), and
+answers the batch with each key's holders once its last chunk is synced
+and every forward has been confirmed or failed. Forwarding is
+synchronous and bounded: per-target queues are small, the forward
+timeout (seconds) is far below the client's batch deadline so one slow
+replica cannot convoy every primary's batches, a replica that does not
+keep up or answer in time fails the key *for this batch* and the reply
 says which and why (`busy` with its hint, `stale-view` — after which
 the primary adopts the newer view and relays it to the client); the
 primary keeps no state about in-flight replication, and a record that
@@ -1837,11 +1841,17 @@ from QUIC's own estimate; a node the client has never dialed is dialed
 when rank order first puts it ahead of a measured one, so measurements
 fill in on first use and no probing traffic is spent on nodes the client
 never needs. `Primary(key)` orders a key's owners under `nodes` by: a
-direct path before a relayed one, then lowest round-trip time, then rank
-— so the write goes to the nearest owner and the LAN, not the client's
-uplink, carries the replication. Reads use the same preference to choose
-which owner to ask first (§6.3 treats the ranking as a hint), and fall
-down the ranking exactly as before. Measurements age out after a minute
+direct path before a relayed one, then the round-trip time in coarse
+classes (under 5 ms, 25 ms, 100 ms, beyond), then rank — so the write
+goes to a near owner and the LAN, not the client's uplink, carries the
+replication, while owners at the same distance share a client's writes
+by rank instead of the nearest taking them all; an owner the client has
+not dialed counts as near, so that rank order puts it in play. Reads use
+the same preference to choose which owner to ask first (§6.3 treats the
+ranking as a hint), and fall down the ranking exactly as before. A
+transfer first probes the members the `view` reply flagged unreachable:
+the hint is one node's view and may be stale, and an owner it demoted
+would otherwise sit out the transfer. Measurements age out after a minute
 without traffic and are re-taken; a path that changes (a punch lands, a
 relay takes over) re-orders the next batch, never one in flight.
 
@@ -1870,7 +1880,8 @@ flow-control windows for the bandwidth-delay product of a WAN path
 (§16), since the library defaults cap a single stream at a few tens of
 MB/s across 40 ms: every `put`/`get` stream is
 independent, so the pool simply holds `Conns` (default 4) connections per
-node and deals batches across them. Per-node pools grow under load and
+node and deals batches across them: a push keeps `Conns` put batches in
+flight per primary, a pull runs its get batches on `Jobs` workers. Per-node pools grow under load and
 shrink after ~90 s idle, as jobs-iroh's `amberclient` does; the total
 cap is at least one control connection per node, so a 50-node cluster is
 never served through evictions. First dials try direct addresses with a
@@ -1904,9 +1915,13 @@ fails naming the owners still short rather than loop.
 `Pull(name)`: `ref-get`; then a top-down frontier walk: keys the local
 store already holds *and* whose subtree `fstree.CheckComplete` confirms
 are pruned (transport-iroh's rule — an interrupted pull leaves parents
-above missing children); the rest are fetched with `Get`, verified,
-written to the local packstore, and tree objects are parsed to extend the
-frontier. A final completeness walk is the gate before the local reference
+above missing children); the rest are fetched as they are discovered —
+keys batched per preferred owner, batches on `Jobs` workers over the
+pooled connections, each record streamed out as it is verified and
+written to the local packstore on a goroutine of its own — and tree
+objects are parsed on arrival to extend the walk, so that fetching,
+writing and parsing overlap instead of following each other level by
+level. A final completeness walk is the gate before the local reference
 is written.
 
 ### 11.6 Gateway mode

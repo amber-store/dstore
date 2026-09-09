@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sort"
 	"sync"
 	"time"
 
@@ -32,6 +31,9 @@ type Config struct {
 	GCInterval time.Duration
 	// RequestTimeout bounds one request; default 2 min.
 	RequestTimeout time.Duration
+	// BatchBytes is the target size of one put batch; default 16 MiB, at
+	// most wire.MaxPutBatch. Conns batches are in flight per primary.
+	BatchBytes int
 }
 
 // Cluster is a handle on a dstore cluster.
@@ -70,6 +72,10 @@ func Dial(ctx context.Context, cfg Config) (*Cluster, error) {
 	if cfg.RequestTimeout == 0 {
 		cfg.RequestTimeout = 2 * time.Minute
 	}
+	if cfg.BatchBytes <= 0 {
+		cfg.BatchBytes = defaultBatchBytes
+	}
+	cfg.BatchBytes = min(cfg.BatchBytes, wire.MaxPutBatch)
 	c := &Cluster{cfg: cfg, log: cfg.Logger, ep: cfg.Endpoint, bootAddrs: map[view.NodeID][]string{}, backoff: map[view.NodeID]time.Time{}, failures: map[view.NodeID]int{}, unreach: map[view.NodeID]struct{}{}}
 	for _, m := range cfg.Ticket.Members {
 		if len(m.ID) == 32 {
@@ -226,6 +232,30 @@ func (c *Cluster) penalty(id view.NodeID) int {
 	return p
 }
 
+// probeHinted checks the members a view reply flagged unreachable before
+// a transfer starts. The hint is one node's view and may be stale; an
+// owner it demoted would otherwise sit out the transfer (§11.1). A probe
+// that answers clears the hint, one that fails adds the usual backoff.
+func (c *Cluster) probeHinted(ctx context.Context) {
+	c.mu.RLock()
+	ids := make([]view.NodeID, 0, len(c.unreach))
+	for id := range c.unreach {
+		ids = append(ids, id)
+	}
+	c.mu.RUnlock()
+	var wg sync.WaitGroup
+	for _, id := range ids {
+		wg.Add(1)
+		go func(id view.NodeID) {
+			defer wg.Done()
+			pctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			_, _ = c.call(pctx, id, &wire.Msg{Type: wire.TView})
+		}(id)
+	}
+	wg.Wait()
+}
+
 // call sends one request to a node and reads one reply.
 func (c *Cluster) call(ctx context.Context, id view.NodeID, m *wire.Msg) (*wire.Msg, error) {
 	cctx, cancel := context.WithTimeout(ctx, c.cfg.RequestTimeout)
@@ -257,52 +287,11 @@ func (c *Cluster) callRetry(ctx context.Context, id view.NodeID, m *wire.Msg) (*
 	return resp, err
 }
 
-// preferred orders node ids by path preference (§11.1): direct before
-// relayed, then lowest RTT, then the given order; penalised nodes last.
+// preferred orders node ids by path preference (§11.1); see rankOwners.
 func (c *Cluster) preferred(ids []view.NodeID) []view.NodeID {
-	type scored struct {
-		id    view.NodeID
-		pen   int
-		relay int
-		rtt   time.Duration
-		pos   int
-	}
-	out := make([]scored, len(ids))
-	for i, id := range ids {
-		s := scored{id: id, pos: i, pen: c.penalty(id), relay: 1, rtt: time.Hour}
-		if p, ok := c.pool.Path(id, wire.ALPNClient); ok {
-			if p.Direct {
-				s.relay = 0
-			}
-			if p.RTT > 0 {
-				s.rtt = p.RTT
-			}
-		} else {
-			// Unmeasured: keep rank order among unmeasured nodes but after
-			// a measured direct one only when it is ranked ahead.
-			s.relay = 0
-			s.rtt = time.Duration(i+1) * time.Hour
-		}
-		out[i] = s
-	}
-	sort.SliceStable(out, func(i, j int) bool {
-		a, b := out[i], out[j]
-		if a.pen != b.pen {
-			return a.pen < b.pen
-		}
-		if a.relay != b.relay {
-			return a.relay < b.relay
-		}
-		if a.rtt != b.rtt {
-			return a.rtt < b.rtt
-		}
-		return a.pos < b.pos
+	return rankOwners(ids, c.penalty, func(id view.NodeID) (transport.PathInfo, bool) {
+		return c.pool.Path(id, wire.ALPNClient)
 	})
-	ids2 := make([]view.NodeID, len(out))
-	for i, s := range out {
-		ids2[i] = s.id
-	}
-	return ids2
 }
 
 // Primary returns the owner of key this client sends writes to.

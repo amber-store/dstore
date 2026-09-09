@@ -73,6 +73,10 @@ type Config struct {
 	ViewRefresh        time.Duration
 	ForwardTimeout     time.Duration
 	MaintenanceTick    time.Duration
+	// PutChunkBytes is how many received bytes a put appends to the store
+	// at a time while the rest of the batch is still arriving; default
+	// 8 MiB.
+	PutChunkBytes int
 	// NoSync disables packstore fsyncs (tests only).
 	NoSync bool
 	// SegmentSize overrides the packstore segment size.
@@ -100,6 +104,9 @@ func (c *Config) defaults() {
 	def(&c.Grace, time.Hour)
 	def(&c.ViewRefresh, 30*time.Second)
 	def(&c.ForwardTimeout, 30*time.Second)
+	if c.PutChunkBytes <= 0 {
+		c.PutChunkBytes = 8 << 20
+	}
 	def(&c.MaintenanceTick, 5*time.Second)
 	if c.Logger == nil {
 		c.Logger = slog.Default()
@@ -145,8 +152,9 @@ type Node struct {
 	joinAddrs map[view.NodeID][]string
 
 	// Write admission.
-	writeSlots chan struct{}
-	writable   atomic.Bool
+	writeSlots   chan struct{} // client-ALPN put admission
+	forwardSlots chan struct{} // cluster-ALPN put admission: forwards and reconcile
+	writable     atomic.Bool
 
 	// Reference coordination.
 	completeMu    sync.Mutex
@@ -230,6 +238,7 @@ func Open(cfg Config) (*Node, error) {
 		jobs = 8
 	}
 	n.writeSlots = make(chan struct{}, 2*jobs)
+	n.forwardSlots = make(chan struct{}, 2*jobs)
 	n.writable.Store(true)
 	n.maint = newMaintenance(n)
 	n.gc = newGCState(n)

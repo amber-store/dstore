@@ -58,7 +58,7 @@ func (n *Network) Partition(a, b view.NodeID, cut bool) {
 	}
 }
 
-// SetDelay adds a fixed latency to every stream open.
+// SetDelay adds a fixed latency to every dial.
 func (n *Network) SetDelay(d time.Duration) {
 	n.mu.Lock()
 	defer n.mu.Unlock()

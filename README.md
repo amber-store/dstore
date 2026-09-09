@@ -85,6 +85,13 @@ or two with the default timers (`cluster status` shows its progress);
 the second node's vote is deferred until a third node joins, when the
 catalog goes from one voter to three in one step (§5.4).
 
+A push spreads its batches over every owner at the same distance from
+the client (round-trip times compare in coarse classes, so the nodes of
+a LAN cluster share a client's writes by rank), keeps four batches of
+16 MiB in flight per primary, and a primary appends and replicates
+records as they arrive; a pull fetches keys as it discovers them, over
+several streams per node, and writes to the local store while fetching.
+
 `push` and `pull` show a progress display when stderr is a terminal: a
 bar, throughput and time left, a per-node table (path, batches in
 flight, bytes, rate) and the client's last events; Ctrl+C cancels the
