@@ -49,19 +49,20 @@ func main() {
 	}
 }
 
-func logger(c *cli.Context) *slog.Logger {
-	var lvl slog.Level
+func logLevel(c *cli.Context) slog.Level {
 	switch strings.ToLower(c.String("log-level")) {
 	case "debug":
-		lvl = slog.LevelDebug
+		return slog.LevelDebug
 	case "warn":
-		lvl = slog.LevelWarn
+		return slog.LevelWarn
 	case "error":
-		lvl = slog.LevelError
-	default:
-		lvl = slog.LevelInfo
+		return slog.LevelError
 	}
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
+	return slog.LevelInfo
+}
+
+func logger(c *cli.Context) *slog.Logger {
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel(c)}))
 }
 
 // ---- shared flags ----

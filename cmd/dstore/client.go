@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -38,6 +39,11 @@ func diskTotal(dir string) int64 {
 // dialCluster connects with an ephemeral identity using --ticket, or a
 // ticket derived from a local store's view.
 func dialCluster(ctx context.Context, c *cli.Context) (*client.Cluster, error) {
+	return dialClusterLog(ctx, c, logger(c))
+}
+
+// dialClusterLog is dialCluster with the client logging to log.
+func dialClusterLog(ctx context.Context, c *cli.Context, log *slog.Logger) (*client.Cluster, error) {
 	var t ticket.Ticket
 	var err error
 	if s := c.String("ticket"); s != "" {
@@ -65,7 +71,7 @@ func dialCluster(ctx context.Context, c *cli.Context) (*client.Cluster, error) {
 	if err != nil {
 		return nil, err
 	}
-	cl, err := client.Dial(ctx, client.Config{Endpoint: ep, Ticket: t, Logger: logger(c), GCInterval: 4 * time.Hour})
+	cl, err := client.Dial(ctx, client.Config{Endpoint: ep, Ticket: t, Logger: log, GCInterval: 4 * time.Hour})
 	if err != nil {
 		ep.Close()
 		return nil, err
@@ -198,16 +204,6 @@ func openLocal(c *cli.Context) (*packstore.Store, *refstore.Store, error) {
 	return st, refs, nil
 }
 
-func progress() client.Progress {
-	last := time.Now()
-	return func(done, total int) {
-		if time.Since(last) > time.Second {
-			fmt.Fprintf(os.Stderr, "\r%d/%d objects", done, total)
-			last = time.Now()
-		}
-	}
-}
-
 func pushCmd() *cli.Command {
 	return &cli.Command{
 		Name:      "push",
@@ -217,7 +213,7 @@ func pushCmd() *cli.Command {
 			&cli.StringFlag{Name: "user", Usage: "user identity recorded in the reference"},
 			&cli.BoolFlag{Name: "force", Usage: "replace unconditionally"},
 			&cli.StringFlag{Name: "expected-version", Usage: "CAS: the version ref get printed (hex); omit to require the name to be new"},
-			&cli.IntFlag{Name: "jobs"},
+			&cli.IntFlag{Name: "jobs"}, noTUIFlag(),
 		),
 		Action: func(c *cli.Context) error {
 			if c.NArg() != 2 {
@@ -240,11 +236,6 @@ func pushCmd() *cli.Command {
 				return err
 			}
 			fmt.Fprintf(os.Stderr, "built %s: %d new objects\n", root.String()[:16], stats.Stored)
-			cl, err := dialCluster(ctx, c)
-			if err != nil {
-				return err
-			}
-			defer cl.Close()
 			cond := client.Cond{Force: c.Bool("force")}
 			if !cond.Force {
 				cond.Versioned = true
@@ -256,8 +247,16 @@ func pushCmd() *cli.Command {
 					cond.ExpectedVersion = b
 				}
 			}
-			ps, err := cl.Push(ctx, st, root, name, c.String("user"), cond, progress())
-			fmt.Fprintln(os.Stderr)
+			var ps client.PushStats
+			err = runTransfer(ctx, c, "push "+name, func(ctx context.Context, log *slog.Logger, prog client.Progress) error {
+				cl, err := dialClusterLog(ctx, c, log)
+				if err != nil {
+					return err
+				}
+				defer cl.Close()
+				ps, err = cl.Push(ctx, st, root, name, c.String("user"), cond, prog)
+				return err
+			})
 			if err != nil {
 				var cm *client.CASMismatch
 				if errors.As(err, &cm) {
@@ -280,7 +279,7 @@ func pullCmd() *cli.Command {
 		Name:      "pull",
 		Usage:     "pull the tree under NAME into the local store",
 		ArgsUsage: "NAME",
-		Flags:     append(clientFlags(), localStoreFlag(), &cli.IntFlag{Name: "jobs"}),
+		Flags:     append(clientFlags(), localStoreFlag(), &cli.IntFlag{Name: "jobs"}, noTUIFlag()),
 		Action: func(c *cli.Context) error {
 			name := c.Args().First()
 			if name == "" {
@@ -294,13 +293,16 @@ func pullCmd() *cli.Command {
 			}
 			defer st.Close()
 			defer refs.Close()
-			cl, err := dialCluster(ctx, c)
-			if err != nil {
+			var ps client.PullStats
+			err = runTransfer(ctx, c, "pull "+name, func(ctx context.Context, log *slog.Logger, prog client.Progress) error {
+				cl, err := dialClusterLog(ctx, c, log)
+				if err != nil {
+					return err
+				}
+				defer cl.Close()
+				ps, err = cl.Pull(ctx, st, name, prog)
 				return err
-			}
-			defer cl.Close()
-			ps, err := cl.Pull(ctx, st, name, progress())
-			fmt.Fprintln(os.Stderr)
+			})
 			if err != nil {
 				return err
 			}

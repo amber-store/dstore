@@ -94,6 +94,7 @@ func Dial(ctx context.Context, cfg Config) (*Cluster, error) {
 			lastErr = err
 			continue
 		}
+		c.log.Info("connected", append([]any{"node", view.ShortID(id), "nodes", len(c.View().Nodes)}, c.pathAttrs(id)...)...)
 		return c, nil
 	}
 	if lastErr == nil {
