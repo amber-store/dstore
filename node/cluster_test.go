@@ -626,3 +626,129 @@ func TestClusterPutStreamsWhileReceiving(t *testing.T) {
 	}
 }
 
+
+// pushTree pushes a fresh random tree and returns its local store, root
+// and keys.
+func pushTree(t *testing.T, c *client.Cluster, files, size int, name string) (*packstore.Store, key.Key, [][32]byte) {
+	t.Helper()
+	local, root, _ := makeTree(t, files, size)
+	if _, err := c.Push(context.Background(), local, root, name, "tester", client.Cond{Force: true}, nil); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	keys, err := fstree.ReachableKeys(root, local.Get)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := make([][32]byte, len(keys))
+	for i, k := range keys {
+		all[i] = [32]byte(k)
+	}
+	return local, root, all
+}
+
+// TestClusterGetYieldsBeforeEveryBatchIsFetched checks that Get streams:
+// with one worker and a stream-open latency, the first record must arrive
+// after one latency, not after every per-node batch has completed.
+func TestClusterGetYieldsBeforeEveryBatchIsFetched(t *testing.T) {
+	h := cluster3(t)
+	defer h.close()
+	ctx := context.Background()
+	c := h.clientWith(t, 100, func(cfg *client.Config) { cfg.Jobs = 1 })
+	defer c.Close()
+	_, _, keys := pushTree(t, c, 30, 20000, "trees/get")
+
+	const delay = 300 * time.Millisecond
+	h.net.SetDelay(delay)
+	defer h.net.SetDelay(0)
+	start := time.Now()
+	seq, _ := c.Get(ctx, keys)
+	var first time.Duration
+	for _, err := range seq {
+		if err != nil {
+			t.Fatal(err)
+		}
+		first = time.Since(start)
+		break
+	}
+	if first == 0 || first >= 2*delay {
+		t.Fatalf("first record after %v with a %v stream latency: Get waited for every batch", first, delay)
+	}
+}
+
+// TestClusterGetStopsEarlyCleanly breaks out of a Get and then uses the
+// client again: the fetch's goroutines must not leak or deadlock.
+func TestClusterGetStopsEarlyCleanly(t *testing.T) {
+	h := cluster3(t)
+	defer h.close()
+	ctx := context.Background()
+	c := h.client(t, 100)
+	_, _, keys := pushTree(t, c, 30, 20000, "trees/early")
+
+	for round := 0; round < 3; round++ {
+		seq, _ := c.Get(ctx, keys)
+		n := 0
+		for _, err := range seq {
+			if err != nil {
+				t.Fatal(err)
+			}
+			n++
+			if n == 2 {
+				break
+			}
+		}
+		if n != 2 {
+			t.Fatalf("round %d: got %d records before breaking", round, n)
+		}
+	}
+	seq, missing := c.Get(ctx, keys)
+	n := 0
+	for _, err := range seq {
+		if err != nil {
+			t.Fatal(err)
+		}
+		n++
+	}
+	if n != len(keys) || len(missing()) != 0 {
+		t.Fatalf("full get after early breaks: %d of %d records, %d missing", n, len(keys), len(missing()))
+	}
+	done := make(chan struct{})
+	go func() { c.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close hung after early breaks")
+	}
+}
+
+// TestClusterPullWithNodeDown pulls a tree with one owner down: every key
+// is served by its next owner in the read order.
+func TestClusterPullWithNodeDown(t *testing.T) {
+	h := cluster3(t)
+	defer h.close()
+	ctx := context.Background()
+	c := h.client(t, 100)
+	defer c.Close()
+	local, root, keys := pushTree(t, c, 30, 20000, "trees/down")
+
+	h.net.SetDown(nid(2), true)
+	defer h.net.SetDown(nid(2), false)
+	pulled, err := packstore.Open(filepath.Join(t.TempDir(), "pulled"), packstore.WithSync(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pulled.Close()
+	ps, err := c.Pull(ctx, pulled, "trees/down", nil)
+	if err != nil {
+		t.Fatalf("pull with a node down: %v", err)
+	}
+	if ps.Root != root || ps.Fetched != len(keys) {
+		t.Fatalf("pulled root %s, %d of %d objects", ps.Root, ps.Fetched, len(keys))
+	}
+	for _, k := range keys {
+		a, _ := local.Get(key.Key(k))
+		b, err := pulled.Get(key.Key(k))
+		if err != nil || !bytes.Equal(a, b) {
+			t.Fatalf("object %x missing or different after pull", k[:8])
+		}
+	}
+}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"iter"
 	"sync"
 	"time"
@@ -20,7 +19,6 @@ import (
 // within one spec-sized batch of memory.
 const (
 	defaultBatchBytes = 16 << 20
-	batchBytes        = 60 << 20 // pull: bytes written to the local store at a time
 	batchKeys         = 8192
 )
 
@@ -336,134 +334,44 @@ type GetResult struct {
 	Record []byte
 }
 
-// Get fetches records, grouping keys by preferred owner and re-asking
-// down the read order (§6.3). It yields every record found; keys not
+// Get fetches records, streaming each as it is verified; keys are batched
+// by preferred owner and re-asked down the read order (§6.3). Keys not
 // found anywhere are returned in missing.
 func (c *Cluster) Get(ctx context.Context, keys [][32]byte) (iter.Seq2[GetResult, error], func() [][32]byte) {
 	var missing [][32]byte
 	var mmu sync.Mutex
 	seq := func(yield func(GetResult, error) bool) {
-		remaining := map[[32]byte]int{} // key → index into its read order
-		for _, k := range keys {
-			remaining[k] = 0
-		}
-		refreshed := false
-		for len(remaining) > 0 {
-			byNode := map[view.NodeID][][32]byte{}
-			var exhausted [][32]byte
-			for k, idx := range remaining {
-				order := c.ReadOrder(k)
-				if idx >= len(order) {
-					exhausted = append(exhausted, k)
+		f := c.newFetcher(ctx)
+		defer f.stop()
+		go func() {
+			seen := make(map[[32]byte]struct{}, len(keys))
+			for _, k := range keys {
+				if _, dup := seen[k]; dup {
 					continue
 				}
-				byNode[order[idx]] = append(byNode[order[idx]], k)
+				seen[k] = struct{}{}
+				if !f.add(k) {
+					return
+				}
 			}
-			if len(exhausted) > 0 {
-				if !refreshed {
-					// A miss at every owner is the signature of a stale view.
-					refreshed = true
-					_ = c.RefreshView(ctx)
-					for _, k := range exhausted {
-						remaining[k] = 0
-					}
-					continue
-				}
+			f.finish()
+		}()
+		for r := range f.results() {
+			if r.rec == nil {
 				mmu.Lock()
-				missing = append(missing, exhausted...)
+				missing = append(missing, r.key)
 				mmu.Unlock()
-				for _, k := range exhausted {
-					delete(remaining, k)
-				}
-				if len(byNode) == 0 {
-					break
-				}
+				continue
 			}
-			type fetched struct {
-				recs map[[32]byte][]byte
-				keys [][32]byte
-				err  error
-			}
-			results := make(chan fetched, len(byNode))
-			var wg sync.WaitGroup
-			sem := make(chan struct{}, c.cfg.Jobs)
-			for id, ks := range byNode {
-				wg.Add(1)
-				go func(id view.NodeID, ks [][32]byte) {
-					defer wg.Done()
-					sem <- struct{}{}
-					defer func() { <-sem }()
-					recs, err := c.getFrom(ctx, id, ks)
-					results <- fetched{recs, ks, err}
-				}(id, ks)
-			}
-			wg.Wait()
-			close(results)
-			for f := range results {
-				for _, k := range f.keys {
-					if rec, ok := f.recs[k]; ok {
-						delete(remaining, k)
-						if !yield(GetResult{Key: k, Record: rec}, nil) {
-							return
-						}
-					} else {
-						remaining[k]++
-					}
-				}
-			}
-			if ctx.Err() != nil {
-				yield(GetResult{}, ctx.Err())
+			if !yield(GetResult{Key: r.key, Record: r.rec}, nil) {
 				return
 			}
 		}
+		if err := ctx.Err(); err != nil {
+			yield(GetResult{}, err)
+		}
 	}
 	return seq, func() [][32]byte { mmu.Lock(); defer mmu.Unlock(); return missing }
-}
-
-// getFrom fetches a batch from one node, verifying every record.
-func (c *Cluster) getFrom(ctx context.Context, id view.NodeID, keys [][32]byte) (map[[32]byte][]byte, error) {
-	out := map[[32]byte][]byte{}
-	for i := 0; i < len(keys); i += batchKeys {
-		end := min(i+batchKeys, len(keys))
-		if err := c.getBatch(ctx, id, keys[i:end], out); err != nil {
-			return out, err
-		}
-	}
-	return out, nil
-}
-
-func (c *Cluster) getBatch(ctx context.Context, id view.NodeID, keys [][32]byte, out map[[32]byte][]byte) error {
-	cctx, cancel := context.WithTimeout(ctx, 10*c.cfg.RequestTimeout)
-	defer cancel()
-	s, err := c.pool.Open(cctx, id, wire.ALPNClient)
-	if err != nil {
-		c.handleErr(id, err)
-		return err
-	}
-	defer wire.CloseStream(s)
-	if err := wire.WriteMsg(s, c.stamp(&wire.Msg{Type: wire.TGet, Keys: wire.RawKeys(keys)})); err != nil {
-		return err
-	}
-	_ = s.CloseWrite()
-	if _, err := wire.Expect(s, wire.TAbsent); err != nil {
-		c.handleErr(id, err)
-		return err
-	}
-	pr := wire.NewPackReader(s)
-	reader := amberpack.NewReader(pr)
-	for raw, err := range reader.Records() {
-		if err != nil {
-			return err
-		}
-		k, rec, err := VerifyRecord(raw)
-		if err != nil {
-			continue // a corrupt copy: the next owner is asked
-		}
-		out[k] = rec
-	}
-	_, _ = io.Copy(io.Discard, pr)
-	c.ok(id)
-	return nil
 }
 
 // VerifyRecord parses and verifies one wire record against its key.
