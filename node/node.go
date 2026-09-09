@@ -85,8 +85,8 @@ type Config struct {
 }
 
 // DefaultSegmentSize is the pack size a node uses unless Config.SegmentSize
-// says otherwise: 2 GiB.
-const DefaultSegmentSize int64 = 2 << 30
+// says otherwise: packstore's default, 2 GiB.
+const DefaultSegmentSize int64 = packstore.DefaultSegmentSize
 
 func (c *Config) defaults() {
 	def := func(d *time.Duration, v time.Duration) {
