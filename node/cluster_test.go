@@ -626,7 +626,6 @@ func TestClusterPutStreamsWhileReceiving(t *testing.T) {
 	}
 }
 
-
 // pushTree pushes a fresh random tree and returns its local store, root
 // and keys.
 func pushTree(t *testing.T, c *client.Cluster, files, size int, name string) (*packstore.Store, key.Key, [][32]byte) {
