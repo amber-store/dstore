@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sort"
 	"sync"
 	"time"
 
@@ -257,52 +256,11 @@ func (c *Cluster) callRetry(ctx context.Context, id view.NodeID, m *wire.Msg) (*
 	return resp, err
 }
 
-// preferred orders node ids by path preference (§11.1): direct before
-// relayed, then lowest RTT, then the given order; penalised nodes last.
+// preferred orders node ids by path preference (§11.1); see rankOwners.
 func (c *Cluster) preferred(ids []view.NodeID) []view.NodeID {
-	type scored struct {
-		id    view.NodeID
-		pen   int
-		relay int
-		rtt   time.Duration
-		pos   int
-	}
-	out := make([]scored, len(ids))
-	for i, id := range ids {
-		s := scored{id: id, pos: i, pen: c.penalty(id), relay: 1, rtt: time.Hour}
-		if p, ok := c.pool.Path(id, wire.ALPNClient); ok {
-			if p.Direct {
-				s.relay = 0
-			}
-			if p.RTT > 0 {
-				s.rtt = p.RTT
-			}
-		} else {
-			// Unmeasured: keep rank order among unmeasured nodes but after
-			// a measured direct one only when it is ranked ahead.
-			s.relay = 0
-			s.rtt = time.Duration(i+1) * time.Hour
-		}
-		out[i] = s
-	}
-	sort.SliceStable(out, func(i, j int) bool {
-		a, b := out[i], out[j]
-		if a.pen != b.pen {
-			return a.pen < b.pen
-		}
-		if a.relay != b.relay {
-			return a.relay < b.relay
-		}
-		if a.rtt != b.rtt {
-			return a.rtt < b.rtt
-		}
-		return a.pos < b.pos
+	return rankOwners(ids, c.penalty, func(id view.NodeID) (transport.PathInfo, bool) {
+		return c.pool.Path(id, wire.ALPNClient)
 	})
-	ids2 := make([]view.NodeID, len(out))
-	for i, s := range out {
-		ids2[i] = s.id
-	}
-	return ids2
 }
 
 // Primary returns the owner of key this client sends writes to.

@@ -480,4 +480,15 @@ func TestClusterPushProgress(t *testing.T) {
 	if len(last.Nodes) == 0 || sum != last.Bytes {
 		t.Fatalf("node bytes %d over %d nodes, want %d", sum, len(last.Nodes), last.Bytes)
 	}
+	// The push spread over every owner: with R = 3 on three nodes each node
+	// is the primary for a share of the keys (§11.1), not only the node the
+	// client dialed first.
+	if len(last.Nodes) != len(h.nodes) {
+		t.Fatalf("push talked to %d of %d nodes", len(last.Nodes), len(h.nodes))
+	}
+	for _, n := range last.Nodes {
+		if n.Bytes == 0 {
+			t.Fatalf("node %s received nothing", view.ShortID(n.ID))
+		}
+	}
 }
