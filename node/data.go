@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"iter"
-	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -279,7 +278,9 @@ func verifyRecord(raw amberpack.RawRecord) ([32]byte, []byte, error) {
 }
 
 // handlePut stores a batch of records it owns and, on the client ALPN,
-// replicates them to the key's other owners (§6.2).
+// replicates them to the key's other owners (§6.2). Records are appended
+// and forwarded as they arrive; the reply waits for the last append to be
+// synced and every forward to be confirmed or failed.
 func (n *Node) handlePut(ctx context.Context, s transport.Stream, m *wire.Msg, client bool, from view.NodeID) error {
 	n.stats.puts.Add(1)
 	if err := n.checkEpoch(m); err != nil {
@@ -291,26 +292,34 @@ func (n *Node) handlePut(ctx context.Context, s transport.Stream, m *wire.Msg, c
 	if !n.writable.Load() {
 		return wire.WriteErr(s, wire.CodeNoSpace, "node below its free-space reserve")
 	}
-	// Admission: a bounded number of concurrent write streams; excess is
-	// simply not read until a slot frees.
+	// Admission: a bounded number of concurrent write streams per ALPN, so
+	// that forwards never wait behind client streams; excess is simply not
+	// read until a slot frees.
+	slots := n.writeSlots
+	if !client {
+		slots = n.forwardSlots
+	}
 	select {
-	case n.writeSlots <- struct{}{}:
+	case slots <- struct{}{}:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	defer func() { <-n.writeSlots }()
+	defer func() { <-slots }()
 
 	pl := n.Placement()
+	tx := n.newPutTx(ctx, pl, client)
 	reader := amberpack.NewReader(wire.NewPackReader(s))
-	batch := &putBatch{records: map[[32]byte][]byte{}}
 	var rejected []wire.KeyReject
 	var total int
+	seen := map[[32]byte]struct{}{}
 	for raw, err := range reader.Records() {
 		if err != nil {
+			tx.abort()
 			return wire.WriteErr(s, wire.CodeBadRequest, "pack: "+err.Error())
 		}
 		total += len(raw.Bytes)
 		if total > wire.MaxPutBatch {
+			tx.abort()
 			return wire.WriteErr(s, wire.CodeBadRequest, "batch over 64 MiB")
 		}
 		k, rec, err := verifyRecord(raw)
@@ -322,39 +331,37 @@ func (n *Node) handlePut(ctx context.Context, s transport.Stream, m *wire.Msg, c
 			rejected = append(rejected, wire.KeyReject{Key: k[:], Reason: wire.CodeNotOwner})
 			continue
 		}
-		if _, dup := batch.records[k]; dup {
+		if _, dup := seen[k]; dup {
 			continue
 		}
-		batch.keys = append(batch.keys, k)
-		batch.records[k] = rec
+		seen[k] = struct{}{}
+		if err := tx.add(k, rec); err != nil {
+			tx.abort()
+			return n.putError(s, err)
+		}
 	}
 	n.stats.bytesIn.Add(uint64(total))
-
-	stored, dedup, err := n.storeBatch(batch)
+	holders, failed, err := tx.finish()
 	if err != nil {
-		if isNoSpace(err) {
-			n.writable.Store(false)
-			return wire.WriteErr(s, wire.CodeNoSpace, err.Error())
-		}
-		return wire.WriteErr(s, wire.CodeInternal, err.Error())
-	}
-	_ = stored
-	_ = dedup
-
-	reply := n.stampReply(&wire.Msg{Type: wire.TPutResult, Rejected: rejected})
-	holders := map[[32]byte][][]byte{}
-	for _, k := range batch.keys {
-		holders[k] = [][]byte{n.id[:]}
+		return n.putError(s, err)
 	}
 	if client {
-		failed := n.forwardBatch(ctx, pl, batch, holders)
-		reply.Failed = failed
-		n.stats.forwarded.Add(uint64(len(batch.keys)))
+		n.stats.forwarded.Add(uint64(len(tx.keys)))
 	}
-	for _, k := range batch.keys {
+	reply := n.stampReply(&wire.Msg{Type: wire.TPutResult, Rejected: rejected, Failed: failed})
+	for _, k := range tx.keys {
 		reply.Holders = append(reply.Holders, wire.KeyHolders{Key: k[:], Holders: holders[k]})
 	}
 	return wire.WriteMsg(s, reply)
+}
+
+// putError answers a store failure.
+func (n *Node) putError(s transport.Stream, err error) error {
+	if isNoSpace(err) {
+		n.writable.Store(false)
+		return wire.WriteErr(s, wire.CodeNoSpace, err.Error())
+	}
+	return wire.WriteErr(s, wire.CodeInternal, err.Error())
 }
 
 // isFormerHoldingBack reports whether this node is an ex-member; it then
@@ -417,48 +424,6 @@ func (n *Node) noteRecent(keys [][32]byte) {
 		n.recent[k] = now
 	}
 	n.recentMu.Unlock()
-}
-
-// forwardBatch replicates a batch to each key's other owners and returns
-// the failures. holders is extended with every owner that confirmed.
-func (n *Node) forwardBatch(ctx context.Context, pl *view.Placement, b *putBatch, holders map[[32]byte][][]byte) []wire.KeyFailure {
-	byOwner := map[view.NodeID][][32]byte{}
-	for _, k := range b.keys {
-		for _, o := range pl.WriteSet(k) {
-			if o != n.id {
-				byOwner[o] = append(byOwner[o], k)
-			}
-		}
-	}
-	var mu sync.Mutex
-	var failed []wire.KeyFailure
-	var wg sync.WaitGroup
-	for o, keys := range byOwner {
-		wg.Add(1)
-		go func(o view.NodeID, keys [][32]byte) {
-			defer wg.Done()
-			fctx, cancel := context.WithTimeout(ctx, n.cfg.ForwardTimeout)
-			defer cancel()
-			ok, errs := n.forwardTo(fctx, o, keys, func(k [32]byte) []byte { return b.records[k] })
-			mu.Lock()
-			for _, k := range ok {
-				holders[k] = append(holders[k], o[:])
-			}
-			for k, reason := range errs {
-				failed = append(failed, wire.KeyFailure{Key: append([]byte{}, k[:]...), Node: o[:], Reason: reason, RetryAfter: int64(500 + rand.IntN(1500))})
-			}
-			mu.Unlock()
-			if len(errs) > 0 {
-				short := make([][32]byte, 0, len(errs))
-				for k := range errs {
-					short = append(short, k)
-				}
-				n.rec.scheduleForward(o, short)
-			}
-		}(o, keys)
-	}
-	wg.Wait()
-	return failed
 }
 
 // forwardTo negotiates keys with one owner and sends what it lacks. It

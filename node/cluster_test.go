@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/amber-store/core/amberpack"
 	"github.com/amber-store/core/fstree"
 	"github.com/amber-store/core/ingest"
 	"github.com/amber-store/core/key"
@@ -60,7 +62,7 @@ func (h *harness) config(i byte, dir string) node.Config {
 		AdoptTimeout: 3 * time.Second, ParticipantTimeout: 30 * time.Second, Delta: 2 * time.Second,
 		FirstAudit: 500 * time.Millisecond, GCInterval: 2 * time.Second, BarrierTimeout: 5 * time.Second,
 		MarkTimeout: 30 * time.Second, SweepTimeout: 30 * time.Second, Grace: time.Millisecond,
-		ForwardTimeout: 10 * time.Second, PutTTL: 10 * time.Minute,
+		ForwardTimeout: 10 * time.Second, PutTTL: 10 * time.Minute, PutChunkBytes: 256 << 10,
 	}
 }
 
@@ -540,3 +542,87 @@ func TestClusterPushPipelines(t *testing.T) {
 		t.Fatalf("at most %d batch in flight per node: batches are not pipelined", maxInFlight)
 	}
 }
+
+// TestClusterPutStreamsWhileReceiving drives one put stream by hand and
+// requires a replica to hold the batch's first record while the second
+// half of the batch is still being sent: the primary appends and forwards
+// records as they arrive instead of after the whole batch is in.
+func TestClusterPutStreamsWhileReceiving(t *testing.T) {
+	h := cluster3(t)
+	defer h.close()
+	ctx := context.Background()
+	n1, n2 := h.nodes[0], h.nodes[1]
+	ep := h.net.Bind(nid(100), wire.ALPNClient)
+	pool := transport.NewPool(ep, func(view.NodeID) []string { return n1.Endpoint().Addrs() }, 1)
+	defer pool.Close()
+
+	// 64 blobs of 64 KiB: the first half fills two 1 MiB wire frames.
+	var recs [][]byte
+	var first key.Key
+	for i := 0; i < 64; i++ {
+		data := make([]byte, 64<<10)
+		rand.Read(data)
+		k, err := key.New(key.Blob, uint64(len(data)), data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec, err := amberpack.EncodeRecord(k, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			first = k
+		}
+		recs = append(recs, rec)
+	}
+	s, err := pool.Open(ctx, n1.ID(), wire.ALPNClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wire.CloseStream(s)
+	v := n1.View()
+	if err := wire.WriteMsg(s, &wire.Msg{Type: wire.TPut, ClusterID: v.ClusterID, Incarnation: v.Incarnation, Epoch: v.Epoch}); err != nil {
+		t.Fatal(err)
+	}
+	var midway error
+	err = wire.SendPackRecords(s, func(yield func([]byte, error) bool) {
+		for i, rec := range recs {
+			if i == len(recs)/2 {
+				deadline := time.Now().Add(10 * time.Second)
+				for {
+					if has, _ := n2.Store().Has(first); has {
+						break
+					}
+					if time.Now().After(deadline) {
+						midway = errors.New("the replica did not hold the first record while the batch was still being sent")
+						break
+					}
+					time.Sleep(20 * time.Millisecond)
+				}
+			}
+			if !yield(rec, nil) {
+				return
+			}
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = s.CloseWrite()
+	resp, err := wire.Expect(s, wire.TPutResult)
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if midway != nil {
+		t.Fatal(midway)
+	}
+	if len(resp.Holders) != len(recs) || len(resp.Failed) != 0 || len(resp.Rejected) != 0 {
+		t.Fatalf("reply: %d holders, %d failed, %d rejected", len(resp.Holders), len(resp.Failed), len(resp.Rejected))
+	}
+	for _, hl := range resp.Holders {
+		if len(hl.Holders) != 3 {
+			t.Fatalf("key %x held by %d owners, want 3", hl.Key[:8], len(hl.Holders))
+		}
+	}
+}
+
