@@ -48,6 +48,7 @@ type Status struct {
 	Corrupt       int         `cbor:"25,keyasint,omitempty"`
 	IsHolder      bool        `cbor:"26,keyasint,omitempty"`
 	UnauditedKeys int         `cbor:"27,keyasint,omitempty"`
+	Watchers      int         `cbor:"28,keyasint,omitempty"` // ref-watch streams served
 }
 
 // status builds the report.
@@ -82,6 +83,7 @@ func (n *Node) status(ctx context.Context) Status {
 	n.recentMu.Lock()
 	st.UnauditedKeys = len(n.recent)
 	n.recentMu.Unlock()
+	st.Watchers = n.watch.count()
 	if ctx != nil {
 		lctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		if l, err := n.cat.ReadLease(lctx); err == nil {

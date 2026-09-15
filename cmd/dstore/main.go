@@ -40,7 +40,7 @@ func main() {
 		},
 		Commands: []*cli.Command{
 			clusterCmd(), serveCmd(), tokenCmd(), nodeCmd(), voterCmd(), transitionCmd(), gcCmd(), catalogCmd(),
-			pushCmd(), pullCmd(), refsCmd(), refCmd(), lsCmd(), catCmd(),
+			pushCmd(), pullCmd(), refsCmd(), watchCmd(), refCmd(), lsCmd(), catCmd(),
 		},
 	}
 	if err := app.Run(os.Args); err != nil {

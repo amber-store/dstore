@@ -110,6 +110,7 @@ func (n *Node) handleRefDelete(ctx context.Context, s transport.Stream, m *wire.
 		return n.catalogErr(s, err)
 	}
 	if !b.IsZero() {
+		n.refChanged(m.Name, nil, b.Bytes())
 		go func() {
 			pctx, cancel := context.WithTimeout(n.ctx, 10*time.Second)
 			defer cancel()
@@ -168,6 +169,7 @@ func (n *Node) handleRefPut(ctx context.Context, s transport.Stream, m *wire.Msg
 	if err != nil {
 		return n.catalogErr(s, err)
 	}
+	n.refChanged(name, m.Record, version)
 	n.log.Info("reference written", "name", name, "took", time.Since(start))
 	return wire.WriteMsg(s, n.stampReply(&wire.Msg{Type: wire.TOK, Key: rec.Key, Version: version}))
 }
@@ -411,5 +413,10 @@ func (n *Node) RefPutLocal(ctx context.Context, name string, record []byte, cond
 	if shortfall > 0 {
 		return nil, fmt.Errorf("incomplete: %d keys short (e.g. %x)", shortfall, missing[0][:8])
 	}
-	return n.cat.RefPut(ctx, name, record, cond, time.Now().Add(n.cfg.PutTTL).UnixNano(), keyOfRecord)
+	version, err := n.cat.RefPut(ctx, name, record, cond, time.Now().Add(n.cfg.PutTTL).UnixNano(), keyOfRecord)
+	if err != nil {
+		return nil, err
+	}
+	n.refChanged(name, record, version)
+	return version, nil
 }

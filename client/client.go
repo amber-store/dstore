@@ -34,6 +34,9 @@ type Config struct {
 	// BatchBytes is the target size of one put batch; default 16 MiB, at
 	// most wire.MaxPutBatch. Conns batches are in flight per primary.
 	BatchBytes int
+	// WatchIdle is how long a reference watch waits for a frame before it
+	// gives the connection up and reconnects; default 2 min.
+	WatchIdle time.Duration
 }
 
 // Cluster is a handle on a dstore cluster.
@@ -76,6 +79,9 @@ func Dial(ctx context.Context, cfg Config) (*Cluster, error) {
 		cfg.BatchBytes = defaultBatchBytes
 	}
 	cfg.BatchBytes = min(cfg.BatchBytes, wire.MaxPutBatch)
+	if cfg.WatchIdle <= 0 {
+		cfg.WatchIdle = 2 * time.Minute
+	}
 	c := &Cluster{cfg: cfg, log: cfg.Logger, ep: cfg.Endpoint, bootAddrs: map[view.NodeID][]string{}, backoff: map[view.NodeID]time.Time{}, failures: map[view.NodeID]int{}, unreach: map[view.NodeID]struct{}{}}
 	for _, m := range cfg.Ticket.Members {
 		if len(m.ID) == 32 {

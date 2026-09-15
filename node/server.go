@@ -126,6 +126,8 @@ func (n *Node) serveClient(ctx context.Context, remote view.NodeID, s transport.
 		return n.handleRefDelete(ctx, s, m)
 	case wire.TRefList:
 		return n.handleRefList(ctx, s, m)
+	case wire.TRefWatch:
+		return n.handleRefWatch(s, m)
 	case wire.TStatus:
 		return n.handleStatus(ctx, s)
 	case wire.TAdmin:
@@ -180,6 +182,9 @@ func (n *Node) serveCluster(ctx context.Context, remote view.NodeID, s transport
 		return wire.WriteMsg(s, n.stampReply(&wire.Msg{Type: wire.TPong}))
 	case wire.TBackupNote:
 		n.noteBackup(m.Key)
+		return wire.WriteMsg(s, &wire.Msg{Type: wire.TAck})
+	case wire.TRefChanged:
+		n.watch.hint(refHint{name: m.Name, record: m.Record, version: m.Version})
 		return wire.WriteMsg(s, &wire.Msg{Type: wire.TAck})
 	case wire.TStatus:
 		return n.handleStatus(ctx, s)

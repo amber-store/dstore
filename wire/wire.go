@@ -53,6 +53,7 @@ const (
 	TRefList   = 39
 	TStatus    = 40
 	TAdmin     = 41
+	TRefWatch  = 42
 
 	// Client ALPN replies.
 	TViewReply    = 48
@@ -66,6 +67,8 @@ const (
 	TRefs         = 56
 	TStatusReply  = 57
 	TAdminReply   = 58
+	TRefChanges   = 59 // one batch of a ref-watch stream
+	TRefSynced    = 60 // a ref-watch stream is caught up (also its heartbeat)
 
 	// Catalog (cluster ALPN).
 	TPrepare = 64
@@ -97,6 +100,7 @@ const (
 	TPing        = 105
 	TPong        = 106
 	TBackupNote  = 107 // record a catalog backup key in the receiver's meta
+	TRefChanged  = 108 // a reference changed: hint for the receiver's watchers (§7)
 )
 
 // Error codes.
@@ -230,6 +234,9 @@ type Msg struct {
 	Status   []byte   `cbor:"57,keyasint,omitempty"`
 	Node     []byte   `cbor:"58,keyasint,omitempty"`
 	Error    string   `cbor:"59,keyasint,omitempty"`
+
+	Pattern string   `cbor:"60,keyasint,omitempty"` // ref-watch glob
+	Deleted []string `cbor:"61,keyasint,omitempty"` // ref-changes: names deleted
 }
 
 // ErrProtocol reports a frame that is valid CBOR but wrong for the moment

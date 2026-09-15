@@ -909,6 +909,31 @@ when the voters disagree. `ref-list` is a majority scan.
 tombstone; no bookkeeping — the next GC snapshot simply stops marking
 from it. When an allowlist is set, deletion needs an `admin` peer (§2).
 
+**Watching.** `ref-watch {pattern, known: [{name, key}]}` opens a stream
+that converges the client to the current keys of the references matching
+a glob and keeps it there: the node first sends the difference between
+the client's list and the catalog — names whose key differs, names the
+client did not list, deletions of names it listed — as `ref-changes
+{refs[], deleted[]}` frames, then `ref-synced`, then each later change as
+it happens, until the client closes the stream. The pattern is
+path-style: `*` and `?` match within one `/`-separated segment, `**` as a
+whole segment matches any number of segments, `[...]` is a class, `\`
+escapes; the literal prefix before the first metacharacter bounds the
+scan. A node learns of changes two ways. The coordinator of every
+committed `ref-put` or `ref-delete` sends `ref-changed {name, record?,
+version}` to every member on the cluster ALPN — the same fire-and-forget
+broadcast as `view-changed` — and applies it to its own watchers; a
+watcher forwards a hint whose version (the commit ballot) is above what
+it last told the client. And every `watch_reconcile` (default 30 s) each
+stream re-scans its prefix with a majority scan, sends whatever the
+hints missed, and sends `ref-synced` again, which doubles as the
+heartbeat. Hints are a latency optimisation: a hint lost to a member
+that was unreachable or restarting is repaired within one interval, and
+nothing is correct only because a hint arrived. Intermediate states
+during a disconnect may be collapsed; the final state always arrives.
+Any node serves watches, voter or not. The client library keeps the
+watch alive across connections (§11.2).
+
 ## 8. Membership change and rebalancing
 
 A change to the placement set (a node joins, leaves, is declared dead,
@@ -1778,6 +1803,7 @@ Every request carries the sender's `epoch`.
 | `ref-put` | `{record, expected_version? \| expected_old?}` | `ok {key, version}` \| `cas-mismatch {current?, version}` \| `incomplete {keys[], shortfall}` |
 | `ref-delete` | `{name, expected_version? \| expected_old?}` | `ok` \| `cas-mismatch {current?, version}` |
 | `ref-list` | `{prefix?, after?}` | `refs {[{name, key, version, created_at, user}], next?}` (pages of ≤ 4 MiB) |
+| `ref-watch` | `{pattern, known: [{name, key}]}` | a stream: `ref-changes {refs[{name, key, version, created_at, user}], deleted[names]}` frames (≤ 4 MiB each) and `ref-synced` after the initial difference and after every reconcile scan, until the client closes the stream (§7) |
 | `status` | — | `status {node stats, view epoch, gc, transition}` |
 
 Every request carries `cluster_id`, `incarnation` and `epoch`; every
@@ -1810,6 +1836,7 @@ privileged client), plus:
 | `gc-keys {g, nonce, seq, keys[], expand}` → `ack` | live key tails for the receiver's mark; `expand` batches carry full keys and are also traversed; roots arrive this way too (§9.4) |
 | `gc-status {g, nonce}` → `{sent, received, idle, marked, missing[]}` | mark termination polling (§9.4) |
 | `view-changed {epoch}` (gossip payload) | latency hint (§5.5) |
+| `ref-changed {name, record?, version}` → `ack` | a reference was written (record absent: deleted); latency hint for the receiver's watchers (§7) |
 
 Transition progress (`participants_ack`, `participants`, `done`) and GC
 progress (`acked`, `mark_done`, `sweep_done`) are CASes on the registers,
@@ -1864,6 +1891,16 @@ relay takes over) re-orders the next batch, never one in flight.
 - `Get(keys) iter` implements §6.3: group by the preferred owner (§11.1), verify,
   re-ask down the read order, per-node backoff (`5 s` after a failure,
   exponential to `60 s`).
+- `WatchRefs(pattern, known) iter` implements §7's watching: it opens the
+  stream on the preferred node, yields each change and a `Synced` marker
+  after the initial difference, and keeps its own copy of `known`
+  current. When the stream or its connection dies, or no frame arrives
+  for `WatchIdle` (default 2 min), it applies the usual backoff to that
+  node, moves to the next in preference order, refreshes the view when
+  none answers, waits a jittered delay (1 s doubling to 30 s), and
+  re-sends the watch from the state it holds — so a reconnect delivers
+  exactly what changed meanwhile. It ends on cancellation or on a
+  terminal error (`bad-request`, `unauthorized`).
 
 ### 11.3 Throughput
 

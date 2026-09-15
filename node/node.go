@@ -73,6 +73,9 @@ type Config struct {
 	ViewRefresh        time.Duration
 	ForwardTimeout     time.Duration
 	MaintenanceTick    time.Duration
+	// WatchReconcile is how often a ref-watch stream re-scans the catalog
+	// to repair what a lost hint missed (§7); default 30 s.
+	WatchReconcile time.Duration
 	// PutChunkBytes is how many received bytes a put appends to the store
 	// at a time while the rest of the batch is still arriving; default
 	// 8 MiB.
@@ -116,6 +119,7 @@ func (c *Config) defaults() {
 		c.SegmentSize = DefaultSegmentSize
 	}
 	def(&c.MaintenanceTick, 5*time.Second)
+	def(&c.WatchReconcile, 30*time.Second)
 	if c.Logger == nil {
 		c.Logger = slog.Default()
 	}
@@ -171,6 +175,9 @@ type Node struct {
 	// Keys written recently, awaiting their first audit (§8.4).
 	recentMu sync.Mutex
 	recent   map[[32]byte]time.Time
+
+	// Reference watch streams served by this node.
+	watch watchers
 
 	// Maintenance.
 	maint *maintenance
