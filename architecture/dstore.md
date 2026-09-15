@@ -1993,6 +1993,27 @@ never expires references. Every node can be a gateway, and clients should be
 given several tickets, so legacy traffic is not funnelled through one
 node.
 
+### 11.7 Working copies
+
+A *working copy* is a directory holding one reference's tree with a
+`.dstore/` beside it: a packstore (every tree fetched or pushed, and the
+copy's lock), a config (ticket, name, connection flags, user) and a
+state file (*base*, the tree the directory was last synced to; *remote*,
+the tree last fetched with its version). `clone` fetches a reference's
+tree and writes it out; `init` starts from the empty tree in an existing
+directory. `fetch` records the reference's tree as remote; `status` and
+`diff` compare the directory with base offline — a file whose size and
+mtime match the base entry is taken as unchanged unless the base mtime
+lies within 2 s of the sync (the racily-clean rule), otherwise it is
+hashed with the single-file ingest; `pull` merges base→remote over
+base→directory per path, keeps local changes, and refuses on a path
+changed on both sides unless forced; `push` ingests the directory
+(`.dstore` excluded), uploads with §11.4 and writes the reference under
+compare-and-swap on the fetched version, refusing when base and remote
+differ. Metadata-only differences (mtime, ownership, xattrs) are counted,
+not listed, and recorded by the next push. Design:
+`docs/superpowers/specs/2026-09-15-working-copy-design.md`.
+
 ## 12. Failure catalogue
 
 | scenario | what happens | what heals it |
@@ -2035,7 +2056,8 @@ dstore gc run [--tolerate-missing] | run --garbage F | status | why KEY   # run 
 dstore cluster status | ticket          # status: view, epoch, reachability, disk, transition, gc, voters; ticket: the bootstrap ticket (§5.5)
 dstore catalog backup | restore KEY|FILE | salvage DIR   # the reference set as an object (below)
 dstore cluster recover --from ID --lost ID,… --lost-destroyed   # majority-loss recovery (below)
-dstore push/pull/ls/refs/ref …          # client commands, as the amber CLI
+dstore store push/pull | ls | cat | refs | ref | watch   # client commands over a standalone local store, as the amber CLI
+dstore clone NAME [DIR] | init NAME | fetch | pull [--force] | push [--force] | status | diff [--remote|--incoming] [--stat] [PATH…]   # working copies (§11.7)
 ```
 
 **Disaster recovery.** The reference set is the only state that is not
