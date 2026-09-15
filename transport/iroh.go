@@ -4,12 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/amber-store/dstore/view"
+	"github.com/tmc/go-iroh/dns"
 	"github.com/tmc/go-iroh/iroh"
+	"github.com/tmc/go-iroh/iroh/mdns"
 	irohkey "github.com/tmc/go-iroh/key"
 	"github.com/tmc/go-iroh/netaddr"
 	"github.com/tmc/go-iroh/relay"
@@ -32,7 +36,24 @@ type IrohConfig struct {
 	// DirectTimeout bounds a first dial at direct addresses before racing the
 	// relay (§11.3); default 2 s.
 	DirectTimeout time.Duration
+	// Discover resolves ids dialed without addresses, or whose addresses all
+	// fail, through mDNS on the local link and, with relays enabled,
+	// number0's DNS service (§5.5). go-iroh runs the resolvers concurrently
+	// and dials the first usable answer.
+	Discover bool
+	// Announce publishes this endpoint's addresses for discovering peers:
+	// mDNS announcements of the direct addresses and, with relays enabled, a
+	// pkarr record at number0's relay carrying the relay URL and the direct
+	// addresses. Nodes announce; clients do not.
+	Announce bool
+	// Logger receives discovery warnings; default slog.Default().
+	Logger *slog.Logger
 }
+
+// mdnsLookupTimeout bounds one mDNS query: a peer on the link answers
+// within a fraction of a second, and a miss must not stall a dial that
+// the DNS lookup may still answer.
+const mdnsLookupTimeout = 3 * time.Second
 
 // IrohEndpoint implements Endpoint over go-iroh.
 type IrohEndpoint struct {
@@ -41,12 +62,33 @@ type IrohEndpoint struct {
 	cfg   IrohConfig
 	addrs []string
 	mu    sync.Mutex
-	// Accepted connections whose ALPN the caller dispatches on.
+
+	// Discovery (§5.5): the lookup services, the pkarr publisher to close,
+	// the context the mDNS listener and the republish loop run under, and
+	// the address set last published.
+	lookup    *iroh.AddressLookupServices
+	pkarr     *iroh.PkarrPublisher
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	published string
 }
 
 // BindIroh binds an iroh endpoint.
 func BindIroh(ctx context.Context, cfg IrohConfig) (*IrohEndpoint, error) {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	e := &IrohEndpoint{cfg: cfg}
+	e.ctx, e.cancel = context.WithCancel(context.Background())
 	opts := []iroh.Option{iroh.WithSecretKey(cfg.SecretKey), iroh.WithALPNs(cfg.ALPNs...)}
+	if cfg.Discover || cfg.Announce {
+		if err := e.setupDiscovery(); err != nil {
+			e.cancel()
+			return nil, err
+		}
+		opts = append(opts, iroh.WithAddressLookup(e.lookup))
+	}
 	if cfg.RelayMode != nil {
 		opts = append(opts, iroh.WithRelayMode(*cfg.RelayMode))
 	} else {
@@ -62,9 +104,10 @@ func BindIroh(ctx context.Context, cfg IrohConfig) (*IrohEndpoint, error) {
 	}))
 	ep, err := iroh.Bind(ctx, opts...)
 	if err != nil {
+		e.close()
 		return nil, fmt.Errorf("transport: bind: %w", err)
 	}
-	e := &IrohEndpoint{ep: ep, cfg: cfg}
+	e.ep = ep
 	e.id = view.NodeID(ep.ID().Bytes())
 	port := ep.LocalAddr().Port()
 	var direct []netip.AddrPort
@@ -88,7 +131,88 @@ func BindIroh(ctx context.Context, cfg IrohConfig) (*IrohEndpoint, error) {
 			e.addrs = append(e.addrs, netaddr.RelayAddr{URL: u}.String())
 		}
 	}
+	if cfg.Announce {
+		e.publish()
+		e.wg.Add(1)
+		go e.republishLoop()
+	}
 	return e, nil
+}
+
+// setupDiscovery registers the lookup services of the configuration and
+// starts the mDNS listener for the endpoint's life.
+func (e *IrohEndpoint) setupDiscovery() error {
+	cfg := e.cfg
+	e.lookup = &iroh.AddressLookupServices{}
+	md := mdns.New(cfg.SecretKey.Public().EndpointID(), mdns.WithPassive(!cfg.Announce), mdns.WithLookupTimeout(mdnsLookupTimeout), mdns.WithLogger(cfg.Logger))
+	if cfg.Discover {
+		e.lookup.AddResolver(md)
+	}
+	if cfg.Announce {
+		e.lookup.AddPublisher(md)
+	}
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		if err := md.Start(e.ctx); err != nil && e.ctx.Err() == nil {
+			cfg.Logger.Warn("transport: mdns discovery unavailable", "error", err)
+		}
+	}()
+	if cfg.RelayMode == nil {
+		return nil // no relay means no external infrastructure
+	}
+	if cfg.Discover {
+		e.lookup.AddResolver(iroh.N0DNSAddressLookup(nil))
+	}
+	if cfg.Announce {
+		all := func(addrs []netaddr.TransportAddr) []netaddr.TransportAddr { return addrs }
+		pk, err := iroh.N0PkarrPublisher(cfg.SecretKey, &iroh.PkarrPublisherConfig{AddrFilter: all})
+		if err != nil {
+			return fmt.Errorf("transport: pkarr publisher: %w", err)
+		}
+		e.lookup.AddPublisher(pk)
+		e.pkarr = pk
+	}
+	return nil
+}
+
+// publish hands the current address set to the lookup services when it
+// differs from the last one published.
+func (e *IrohEndpoint) publish() {
+	addrs := e.Addrs()
+	key := strings.Join(addrs, " ")
+	e.mu.Lock()
+	changed := key != e.published
+	e.published = key
+	e.mu.Unlock()
+	if changed && len(addrs) > 0 {
+		e.lookup.Publish(dns.NewEndpointData(ParseAddrs(addrs)...))
+	}
+}
+
+// republishLoop publishes again whenever the address set changes, such
+// as a relay URL that appears after bind.
+func (e *IrohEndpoint) republishLoop() {
+	defer e.wg.Done()
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case <-t.C:
+			e.publish()
+		}
+	}
+}
+
+// close stops the discovery goroutines and the pkarr publisher.
+func (e *IrohEndpoint) close() {
+	e.cancel()
+	if e.pkarr != nil {
+		_ = e.pkarr.Close()
+	}
+	e.wg.Wait()
 }
 
 // Raw returns the underlying iroh endpoint.
@@ -164,19 +288,31 @@ func (e *IrohEndpoint) Dial(ctx context.Context, id view.NodeID, addrs []string,
 			return &irohConn{c: c}, nil
 		}
 		if len(relays) == 0 {
-			return nil, err
+			return e.discoverDial(ctx, eid, alpn, err)
 		}
 	}
 	if len(relays) > 0 {
 		c, err := raceConnect(ctx, e.ep, eid, append(relays, direct...), alpn)
 		if err != nil {
-			return nil, err
+			return e.discoverDial(ctx, eid, alpn, err)
 		}
 		return &irohConn{c: c}, nil
 	}
-	// No addresses known: let iroh's own resolution try.
+	return e.discoverDial(ctx, eid, alpn, nil)
+}
+
+// discoverDial resolves id through the lookup services and dials what
+// they find (§5.5). prev is the error of the dial at the given addresses,
+// if there were any: without lookup services it stands.
+func (e *IrohEndpoint) discoverDial(ctx context.Context, eid irohkey.EndpointID, alpn string, prev error) (Conn, error) {
+	if e.lookup == nil && prev != nil {
+		return nil, prev
+	}
 	c, err := e.ep.Connect(ctx, netaddr.NewEndpointAddr(eid), alpn)
 	if err != nil {
+		if prev != nil {
+			return nil, errors.Join(prev, fmt.Errorf("discovery: %w", err))
+		}
 		return nil, err
 	}
 	return &irohConn{c: c}, nil
@@ -263,6 +399,7 @@ func (e *IrohEndpoint) Accept(ctx context.Context) (Conn, error) {
 
 // Close shuts the endpoint down.
 func (e *IrohEndpoint) Close() error {
+	e.close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return e.ep.Shutdown(ctx)

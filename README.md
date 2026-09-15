@@ -33,7 +33,7 @@ for filesystem trees, reachable over [iroh](https://iroh.computer).
 | `meta` | a node's bookkeeping database (§6.1) |
 | `node` | the storage node: both ALPNs, the data path with primary forwarding, reference coordination, the lease-driven coordinator, voter changes with sync, transitions with the reconcile pass, garbage collection (§6–§9) |
 | `client` | the cluster handle: view cache, owner preference by path, `Missing`/`Put`/`Get`, tree push and pull (§11) |
-| `ticket` | the `dstore1…` bootstrap ticket (§5.5) |
+| `ticket` | the `dstore1…` bootstrap ticket and its short form, a list of node ids (§5.5) |
 | `cmd/dstore` | the CLI (§13) |
 
 ## Running a cluster
@@ -47,13 +47,14 @@ dstore serve --store /srv/n1
 dstore token create --ticket dstore1…
 dstore node join --store /srv/n2 --seed dstore1… --token <hex> --weight auto
 
-# clients
+# clients: --ticket takes the ticket or the ids `cluster ticket --ids` prints
 dstore push --ticket dstore1… --local ~/.amber ./tree trees/demo
 dstore pull --ticket dstore1… --local ~/.amber trees/demo
 dstore refs --ticket dstore1…
 dstore watch --ticket dstore1… 'trees/**'   # prints each change until Ctrl+C
 dstore ls  --ticket dstore1… trees/demo sub
 dstore cat --ticket dstore1… trees/demo hello.txt
+dstore refs --ticket 3f9a…,b71c…                     # member ids, found by discovery
 
 # operations
 dstore cluster status --ticket dstore1…
@@ -78,6 +79,16 @@ relay-reachable cluster is writable by anyone who learns its ticket
 until the client allowlist is set (see the gaps below). The
 [dstore-operator](https://github.com/amber-store/dstore-operator) runs
 it on Kubernetes.
+
+A client that has only the ids of some members finds their addresses by
+discovery: every node announces its direct addresses over mDNS on its
+link and, when relays are enabled, publishes its relay URL and direct
+addresses to number0's DNS service, keyed by its id; a client dialing an
+id asks both at once and dials the first answer. After the first member
+answers, the view supplies the rest. `--no-discovery`
+(`DSTORE_NO_DISCOVERY`, or `DSTORE_EXTRA_ARGS` in the container) turns
+announcing and resolving off; `--no-relay` keeps mDNS but skips the
+number0 service. The full ticket needs no discovery at all.
 
 `--no-relay --loopback` run everything on one machine without relays;
 `DSTORE_TICKET` and `DSTORE_STORE` stand in for the flags. Every node

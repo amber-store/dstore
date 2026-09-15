@@ -1,7 +1,8 @@
 #!/bin/sh
 # Runs three dstore nodes over real iroh endpoints on the loopback
 # interface (no relays), pushes a tree, reads it back, runs a GC cycle,
-# and checks that a watch saw the push and the delete.
+# checks that a watch saw the push and the delete, and connects a client
+# by node ids alone.
 # Everything lives under a temporary directory that is removed on exit.
 set -eu
 W=$(mktemp -d "${TMPDIR:-/tmp}/dstore-e2e.XXXXXX")
@@ -43,6 +44,10 @@ $B refs --no-relay
 $B ls --no-relay trees/demo sub | grep -q g.bin
 [ "$($B cat --no-relay trees/demo hello.txt)" = "hello dstore" ]
 $B pull --local local2 --no-relay trees/demo
+# Ids alone reach the cluster: the nodes announce over mDNS.
+IDS=$($B cluster ticket --no-relay --ids)
+echo "node ids: $IDS"
+$B refs --no-relay --ticket "$IDS" | grep -q '^trees/demo' || { echo "id-only client did not see the reference"; exit 1; }
 $B ref get --no-relay trees/demo
 $B gc run --no-relay
 $B ref delete --no-relay trees/demo

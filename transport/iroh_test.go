@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/amber-store/dstore/wire"
+	"github.com/tmc/go-iroh/iroh/mdns"
 	irohkey "github.com/tmc/go-iroh/key"
 )
 
@@ -269,4 +270,88 @@ func TestIrohPathRTTIsUnknownUntilSampled(t *testing.T) {
 	}
 	wire.CloseStream(s)
 	check("after one exchange")
+}
+
+// TestIrohDiscoverByID dials a server by id alone: the server announces
+// its loopback address over mDNS and the client resolves it (§5.5).
+func TestIrohDiscoverByID(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// A host that cannot open an mDNS listener cannot run this test.
+	probeKey, _ := irohkey.GenerateSecretKey()
+	probe := mdns.New(probeKey.Public().EndpointID(), mdns.WithPassive(true))
+	pctx, pcancel := context.WithCancel(ctx)
+	perr := make(chan error, 1)
+	go func() { perr <- probe.Start(pctx) }()
+	select {
+	case err := <-perr:
+		pcancel()
+		t.Skipf("no mdns listener: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	pcancel()
+
+	bind := func(cfg IrohConfig) *IrohEndpoint {
+		sk, err := irohkey.GenerateSecretKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.SecretKey = sk
+		ep, err := BindIroh(ctx, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { ep.Close() })
+		return ep
+	}
+	server := bind(IrohConfig{ALPNs: []string{wire.ALPNClient}, Loopback: true, Discover: true, Announce: true})
+	client := bind(IrohConfig{Discover: true})
+
+	go func() {
+		c, err := server.Accept(ctx)
+		if err != nil {
+			return
+		}
+		s, err := c.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		if m, err := wire.ReadMsg(s); err == nil {
+			_ = wire.WriteMsg(s, &wire.Msg{Type: wire.TPong, Epoch: m.Epoch})
+		}
+		wire.CloseStream(s)
+	}()
+
+	conn, err := client.Dial(ctx, server.ID(), nil, wire.ALPNClient)
+	if err != nil {
+		t.Fatalf("dial by id: %v", err)
+	}
+	defer conn.Close()
+	if conn.RemoteID() != server.ID() {
+		t.Fatal("connected to the wrong peer")
+	}
+	s, err := conn.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wire.WriteMsg(s, &wire.Msg{Type: wire.TPing, Epoch: 7}); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.CloseWrite()
+	if m, err := wire.ReadMsg(s); err != nil || m.Type != wire.TPong || m.Epoch != 7 {
+		t.Fatalf("reply %+v %v", m, err)
+	}
+	// Wrong addresses fall back to discovery.
+	conn2, err := client.Dial(ctx, server.ID(), []string{"ip:127.0.0.1:9"}, wire.ALPNClient)
+	if err != nil {
+		t.Fatalf("dial with a bad address: %v", err)
+	}
+	conn2.Close()
+	// Without discovery a dial by id alone fails.
+	plain := bind(IrohConfig{})
+	dctx, dcancel := context.WithTimeout(ctx, 3*time.Second)
+	defer dcancel()
+	if _, err := plain.Dial(dctx, server.ID(), nil, wire.ALPNClient); err == nil {
+		t.Fatal("dial by id without discovery succeeded")
+	}
 }

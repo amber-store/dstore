@@ -67,7 +67,7 @@ func dialClusterLog(ctx context.Context, c *cli.Context, log *slog.Logger) (*cli
 	if err != nil {
 		return nil, err
 	}
-	ep, err := transport.BindIroh(ctx, transport.IrohConfig{SecretKey: sk, RelayMode: rm})
+	ep, err := transport.BindIroh(ctx, transport.IrohConfig{SecretKey: sk, RelayMode: rm, Discover: !c.Bool("no-discovery"), Logger: log})
 	if err != nil {
 		return nil, err
 	}
