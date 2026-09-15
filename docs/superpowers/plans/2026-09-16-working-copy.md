@@ -54,13 +54,13 @@
 **Interfaces:**
 - Produces: `ingest.Opts.Exclude []string` — names directly under the root never ingested, regardless of `NoIgnore`; `ingest.ScanWith(dir string, opts Opts) (files, bytes int64, err error)`.
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 ```bash
 cd ~/jobs-build/amber-store-core && git checkout main && git pull --ff-only && git checkout -b ingest-exclude
 ```
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 `ingest/exclude_test.go`:
 
@@ -153,12 +153,12 @@ func TestScanWith_HonorsExclude(t *testing.T) {
 }
 ```
 
-- [ ] **Step 3: Run the tests to see them fail**
+- [x] **Step 3: Run the tests to see them fail**
 
 Run: `cd ~/jobs-build/amber-store-core && go test ./ingest -run 'TestExclude|TestScanWith' -v`
 Expected: compile errors (`Opts` has no field `Exclude`; `ScanWith` undefined).
 
-- [ ] **Step 4: Implement**
+- [x] **Step 4: Implement**
 
 In `ingest/ingest.go`, add to `Opts` after `Progress`:
 
@@ -257,12 +257,12 @@ and at the top of the loop in `scanner.walk`:
 		}
 ```
 
-- [ ] **Step 5: Run the ingest tests**
+- [x] **Step 5: Run the ingest tests**
 
 Run: `cd ~/jobs-build/amber-store-core && go test ./ingest && go vet ./ingest`
 Expected: PASS.
 
-- [ ] **Step 6: Document and commit**
+- [x] **Step 6: Document and commit**
 
 In core's `README.md`, in the ingest row of the package table, append: "`Opts.Exclude` skips names at the root (a working copy's metadata directory)." Then:
 
@@ -285,7 +285,7 @@ the same options."
 **Files:**
 - Modify: `go.mod`, `go.sum`
 
-- [ ] **Step 1: Point core at the local branch and add go-udiff**
+- [x] **Step 1: Point core at the local branch and add go-udiff**
 
 ```bash
 cd ~/amber-store/dstore
@@ -296,12 +296,12 @@ go mod tidy
 
 `go mod tidy` will drop go-udiff again because nothing imports it yet; that is fine, Task 8 runs `go get` again. What matters now is the `replace` line.
 
-- [ ] **Step 2: Verify the build still passes with the cgo env**
+- [x] **Step 2: Verify the build still passes with the cgo env**
 
 Run: `go build ./... && go vet ./...`
 Expected: no output.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add go.mod go.sum && git commit -m "Build against the ingest-exclude branch of core (temporary replace)"
@@ -329,7 +329,7 @@ git add go.mod go.sum && git commit -m "Build against the ingest-exclude branch 
   - `func EmptyTree() (key.Key, []byte)`
   - `var ErrNotWorkingCopy, ErrIncomplete error`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `worktree/tree_test.go`:
 
@@ -424,12 +424,12 @@ func TestRemove(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run to see it fail**
+- [x] **Step 2: Run to see it fail**
 
 Run: `go test ./worktree`
 Expected: compile errors (package has no Go files).
 
-- [ ] **Step 3: Implement `worktree/tree.go`**
+- [x] **Step 3: Implement `worktree/tree.go`**
 
 ```go
 // Package worktree implements dstore working copies: a directory holding a
@@ -679,12 +679,12 @@ func writeJSON(path string, v any) error {
 }
 ```
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `go test ./worktree -v`
 Expected: PASS (3 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add worktree && git commit -m "worktree: the working copy layout, config and state"
@@ -709,7 +709,7 @@ git add worktree && git commit -m "worktree: the working copy layout, config and
   - `func expand(get Getter, prefix string, e *fstree.Entry, kind Kind, out *[]Change) error` and `func expandChildren(get Getter, p string, e *fstree.Entry, kind Kind, out *[]Change) error` (unexported, reused by scan). A type change of a directory is followed by Deleted changes for its former contents; a path that became a directory by Added changes for its new contents.
   - `func joinPath(prefix, name string) string`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `worktree/change_test.go`:
 
@@ -890,12 +890,12 @@ func TestCompare(t *testing.T) {
 
 (add `"github.com/amber-store/core/fstree"` to the imports.)
 
-- [ ] **Step 2: Run to see it fail**
+- [x] **Step 2: Run to see it fail**
 
 Run: `go test ./worktree -run 'TestDiffTrees|TestCompare'`
 Expected: compile errors (undefined: Kind, DiffTrees, Compare).
 
-- [ ] **Step 3: Implement `worktree/change.go`**
+- [x] **Step 3: Implement `worktree/change.go`**
 
 ```go
 package worktree
@@ -1136,12 +1136,12 @@ func expandChildren(get Getter, p string, e *fstree.Entry, kind Kind, out *[]Cha
 }
 ```
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `go test ./worktree -run 'TestDiffTrees|TestCompare' -v`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add worktree && git commit -m "worktree: changes and the tree-to-tree diff"
@@ -1161,7 +1161,7 @@ git add worktree && git commit -m "worktree: changes and the tree-to-tree diff"
 - Consumes: `Change`, `Kind`, `Compare`, `IsDir`, `expand`, `expandChildren`, `joinPath` (Task 4); `Dir`, `Getter` (Task 3).
 - Produces: `const RacyWindow = 2 * time.Second`; `func Scan(root string, base key.Key, get Getter, syncedAt time.Time, jobs int) ([]Change, error)` — changes from the tree `base` to the directory `root`, with `Old` the base entry and `New` the entry as it is on disk (content key computed, xattrs encoded as ingest would). `syncedAt` must be a real time (the flows pass the state's `SyncedAt`; `diff --remote` passes `time.Now()`).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `worktree/scan_test.go`:
 
@@ -1324,12 +1324,12 @@ func TestScan_Xattr(t *testing.T) {
 
 (add `"github.com/amber-store/core/key"` and `"github.com/amber-store/core/packstore"` to the imports.)
 
-- [ ] **Step 2: Run to see it fail**
+- [x] **Step 2: Run to see it fail**
 
 Run: `go test ./worktree -run TestScan`
 Expected: compile error (undefined: Scan).
 
-- [ ] **Step 3: Implement the xattr readers**
+- [x] **Step 3: Implement the xattr readers**
 
 `worktree/xattr.go` (mirrors core's `ingest`, whose readers are unexported):
 
@@ -1431,7 +1431,7 @@ func setXattr(path, name string, value []byte) error {
 }
 ```
 
-- [ ] **Step 4: Implement `worktree/scan.go`**
+- [x] **Step 4: Implement `worktree/scan.go`**
 
 ```go
 package worktree
@@ -1720,12 +1720,12 @@ func hashFile(path string, jobs int) (key.Key, error) {
 }
 ```
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `go test ./worktree -run TestScan -v`
 Expected: PASS (TestScan_Xattr may skip on a filesystem without xattrs).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add worktree && git commit -m "worktree: scan the working directory against a tree"
@@ -1745,7 +1745,7 @@ git add worktree && git commit -m "worktree: scan the working directory against 
 - Consumes: `Change`, `Kind`, `IsDir`, `Equivalent` (Task 4).
 - Produces: `type Conflict struct { Path string; Local, Incoming Change }`; `func Merge(local, incoming []Change) (apply []Change, conflicts []Conflict)`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `worktree/merge_test.go`:
 
@@ -1843,12 +1843,12 @@ func TestMerge(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run to see it fail**
+- [x] **Step 2: Run to see it fail**
 
 Run: `go test ./worktree -run TestMerge`
 Expected: compile error (undefined: Merge, Conflict).
 
-- [ ] **Step 3: Implement `worktree/merge.go`**
+- [x] **Step 3: Implement `worktree/merge.go`**
 
 ```go
 package worktree
@@ -1933,12 +1933,12 @@ func Merge(local, incoming []Change) (apply []Change, conflicts []Conflict) {
 }
 ```
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `go test ./worktree -run TestMerge -v`
 Expected: PASS. (In "remote retypes dir with local edits below", `d` conflicts by the retype rule and `d/x` by the per-path rule.)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add worktree && git commit -m "worktree: the three-way merge for pull"
@@ -1958,7 +1958,7 @@ git add worktree && git commit -m "worktree: the three-way merge for pull"
 - Consumes: `Change`, `Kind`, `IsDir` (Task 4); `setXattr` (Task 5); `Getter` (Task 3).
 - Produces: `func Apply(root string, changes []Change, get Getter) error` — deletions first (deepest paths first; a directory only when empty), then additions and modifications in path order, directory permission bits and mtimes last. Regular files go through a temporary file (`.dstore-tmp-*` beside the target) and a rename. Sockets are skipped. Re-applying the same list is a no-op. Refuses unsafe names and writes through symlinked ancestors.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `worktree/apply_test.go`:
 
@@ -2143,12 +2143,12 @@ func TestApply_RefusesSymlinkedAncestor(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run to see it fail**
+- [x] **Step 2: Run to see it fail**
 
 Run: `go test ./worktree -run TestApply`
 Expected: compile error (undefined: Apply).
 
-- [ ] **Step 3: Implement `worktree/apply.go`**
+- [x] **Step 3: Implement `worktree/apply.go`**
 
 ```go
 package worktree
@@ -2455,12 +2455,12 @@ func entryXattrs(e *fstree.Entry, get Getter) (map[string][]byte, error) {
 }
 ```
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `go test ./worktree -run TestApply -v`
 Expected: PASS. If `TestApply_CloneThenUpdateReproducesTrees` fails on the root key, diff the two ingests entry by entry (mtime and mode are the usual culprits; the fixtures set mtimes explicitly on the paths whose mtime must match, everything else is freshly written on both sides but compared through the tree that Apply reproduces, so mtimes come from the entries).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add worktree && git commit -m "worktree: apply changes to the working directory"
@@ -2486,7 +2486,7 @@ git add worktree && git commit -m "worktree: apply changes to the working direct
   - `func Unified(w io.Writer, changes []Change, old, new Source) error`
   - `func Stat(w io.Writer, changes []Change, old, new Source) error`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `worktree/diff_test.go`:
 
@@ -2595,7 +2595,7 @@ func TestStat(t *testing.T) {
 
 (add `"github.com/amber-store/core/key"` and `"github.com/amber-store/core/packstore"` to the imports.)
 
-- [ ] **Step 2: Add the dependency and run to see it fail**
+- [x] **Step 2: Add the dependency and run to see it fail**
 
 ```bash
 go get github.com/aymanbagabas/go-udiff@v0.4.1
@@ -2604,7 +2604,7 @@ go test ./worktree -run 'TestUnified|TestStat'
 
 Expected: compile error (undefined: Unified, Stat, TreeSource, DiskSource).
 
-- [ ] **Step 3: Implement `worktree/diff.go`**
+- [x] **Step 3: Implement `worktree/diff.go`**
 
 ```go
 package worktree
@@ -2815,12 +2815,12 @@ func Stat(w io.Writer, changes []Change, old, new Source) error {
 }
 ```
 
-- [ ] **Step 4: Run the tests and tidy**
+- [x] **Step 4: Run the tests and tidy**
 
 Run: `go mod tidy && go test ./worktree -v`
 Expected: every `worktree` test passes.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add go.mod go.sum worktree && git commit -m "worktree: unified diffs and stat with go-udiff"
@@ -2849,7 +2849,7 @@ git add go.mod go.sum worktree && git commit -m "worktree: unified diffs and sta
   - `func (t *Tree) Fetch(ctx, cl, prog) (FetchResult, error)`, `Pull(ctx, cl, force bool, jobs int, prog) (PullResult, error)`, `Push(ctx, cl, user string, force bool, jobs int, prog) (PushResult, error)`, `Status(jobs int) (Status, error)`
   - `func TicketFromView(v *view.View) ticket.Ticket`, `func (t *Tree) RefreshTicket(cl *client.Cluster) error`
 
-- [ ] **Step 1: Write the failing end-to-end tests**
+- [x] **Step 1: Write the failing end-to-end tests**
 
 `node/worktree_test.go`:
 
@@ -3097,12 +3097,12 @@ func TestWorktreePushRecoversAfterLostState(t *testing.T) {
 
 (add `"github.com/amber-store/dstore/client"` to the imports.)
 
-- [ ] **Step 2: Run to see it fail**
+- [x] **Step 2: Run to see it fail**
 
 Run: `go test ./node -run TestWorktree`
 Expected: compile errors (undefined: worktree.Init, Clone, …).
 
-- [ ] **Step 3: Implement `worktree/flow.go`**
+- [x] **Step 3: Implement `worktree/flow.go`**
 
 ```go
 package worktree
@@ -3438,12 +3438,12 @@ func (t *Tree) RefreshTicket(cl *client.Cluster) error {
 }
 ```
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `go test ./node -run TestWorktree -v` (a three-node in-memory cluster takes a minute or two per test), then `go vet ./...`.
 Expected: the three tests PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add worktree node/worktree_test.go && git commit -m "worktree: clone, init, fetch, pull, push and status over a cluster"
@@ -3465,7 +3465,7 @@ git add worktree node/worktree_test.go && git commit -m "worktree: clone, init, 
 - Consumes: everything exported from `worktree`; `runTransfer`, `noTUIFlag`, `signalCtx`, `logger` (existing).
 - Produces: commands `clone`, `init`, `fetch`, `pull`, `push`, `status`, `diff`, `store`; `func resolveTicket(flag, stored, env string) (string, error)`; `type netOpts struct { Relay string; NoRelay, NoDiscovery bool }`; `func dialTicket(ctx context.Context, t ticket.Ticket, n netOpts, log *slog.Logger) (*client.Cluster, error)`.
 
-- [ ] **Step 1: Write the failing test for ticket precedence**
+- [x] **Step 1: Write the failing test for ticket precedence**
 
 `cmd/dstore/wc_test.go`:
 
@@ -3492,12 +3492,12 @@ func TestResolveTicket(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run to see it fail**
+- [x] **Step 2: Run to see it fail**
 
 Run: `go test ./cmd/dstore -run TestResolveTicket`
 Expected: compile error (undefined: resolveTicket).
 
-- [ ] **Step 3: Refactor dialing in `cmd/dstore/client.go`**
+- [x] **Step 3: Refactor dialing in `cmd/dstore/client.go`**
 
 Replace `dialClusterLog` and `relayMode` usage with:
 
@@ -3598,7 +3598,7 @@ func storeCmd() *cli.Command {
 
 In `main.go`'s command list replace `pushCmd(), pullCmd(),` with `storeCmd(), cloneCmd(), initCmd(), fetchCmd(), pullCmd(), pushCmd(), statusCmd(), diffCmd(),` (the new `pullCmd`/`pushCmd` are the working-copy ones defined next).
 
-- [ ] **Step 4: Write `cmd/dstore/wc.go`**
+- [x] **Step 4: Write `cmd/dstore/wc.go`**
 
 ```go
 package main
@@ -4092,12 +4092,12 @@ func filterPaths(root string, changes []worktree.Change, args []string) ([]workt
 }
 ```
 
-- [ ] **Step 5: Build, vet, run the CLI tests**
+- [x] **Step 5: Build, vet, run the CLI tests**
 
 Run: `go build ./... && go vet ./... && go test ./cmd/dstore`
 Expected: PASS. `TestResolveTicket` passes; existing CLI tests unchanged.
 
-- [ ] **Step 6: Smoke test by hand over loopback**
+- [x] **Step 6: Smoke test by hand over loopback**
 
 Build a binary into the scratchpad, start a one-node cluster with `--allow-unsafe` there, and walk through the commands; delete the binary and the store afterwards:
 
@@ -4116,7 +4116,7 @@ kill $(cat $S/serve.pid); rm -rf $S/dstore $S/n1 $S/src $S/copy $S/serve.pid
 
 Expected: `status` after init lists `new hello.txt`; the clone's status shows `modified hello.txt` and the diff `+world`; after the pull, `src/hello.txt` holds both lines and status says `nothing to push`.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add cmd/dstore && git commit -m "dstore clone, init, fetch, pull, push, status, diff; store push/pull"
@@ -4132,7 +4132,7 @@ git add cmd/dstore && git commit -m "dstore clone, init, fetch, pull, push, stat
 - Modify: `README.md` (running section: the client commands block; a new "Working copies" section after it; the layout table gets a `worktree` row)
 - Modify: `architecture/dstore.md` (§11: a new §11.7 before §12; §13: the command list)
 
-- [ ] **Step 1: README**
+- [x] **Step 1: README**
 
 In the layout table, after the `client` row add:
 
@@ -4182,7 +4182,7 @@ recorded by the next push. `.dstore/packstore` grows with every fetch and
 push; there is no local compaction yet.
 ```
 
-- [ ] **Step 2: architecture/dstore.md**
+- [x] **Step 2: architecture/dstore.md**
 
 Before `## 12. Failure catalogue`, add:
 
@@ -4216,7 +4216,7 @@ dstore store push/pull | ls | cat | refs | ref | watch   # client commands over 
 dstore clone NAME [DIR] | init NAME | fetch | pull [--force] | push [--force] | status | diff [--remote|--incoming] [--stat] [PATH…]   # working copies (§11.7)
 ```
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add README.md architecture/dstore.md && git commit -m "Document working copies"
@@ -4231,7 +4231,7 @@ git add README.md architecture/dstore.md && git commit -m "Document working copi
 **Files:**
 - Modify: `go.mod`, `go.sum`
 
-- [ ] **Step 1: Push the core branch and open its PR**
+- [x] **Step 1: Push the core branch and open its PR**
 
 ```bash
 cd ~/jobs-build/amber-store-core && git push -u origin ingest-exclude
@@ -4240,7 +4240,7 @@ gh pr create --title "ingest: Opts.Exclude skips root names; ScanWith" --body ".
 
 The body: what Exclude is for (dstore working copies keep `.dstore` inside the tree), root-only and independent of NoIgnore, `ScanWith`, and the attribution footer.
 
-- [ ] **Step 2: Point dstore at the branch commit instead of the local path**
+- [x] **Step 2: Point dstore at the branch commit instead of the local path**
 
 ```bash
 cd ~/amber-store/dstore
@@ -4253,12 +4253,12 @@ go build ./... && go vet ./... && go test ./worktree ./cmd/dstore
 
 Expected: `go.mod` requires a pseudo-version `v0.0.8-0.<date>-<sha>` and everything builds. (`GONOSUMDB`/`GOPRIVATE` are not needed for the public repo; if the proxy has not seen the commit yet, `GOPROXY=direct` for the `go get`.)
 
-- [ ] **Step 3: Full test run**
+- [x] **Step 3: Full test run**
 
 Run: `go test ./...` (about six minutes with the new cluster tests).
 Expected: every package ok.
 
-- [ ] **Step 4: Commit and push, open the dstore PR**
+- [x] **Step 4: Commit and push, open the dstore PR**
 
 ```bash
 git add go.mod go.sum && git commit -m "Depend on core's ingest-exclude branch (v0.0.8 once released)"
