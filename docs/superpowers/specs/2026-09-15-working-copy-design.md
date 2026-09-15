@@ -126,7 +126,8 @@ success, adopting the current version; any other mismatch says
 version, and `synced_at` now. The user recorded in the reference is
 `--user`, else the config's `user`, else the OS user name.
 
-**status.** Prints the reference name and the short base key, then one
+**status.** Prints the reference name and the first 16 hex digits of
+the base key, then one
 line about the remote: `up to date`, `moved since your last fetch (+A
 ~M -D; run pull)` with counts of added, modified and deleted paths from
 the tree diff base→remote, or `deleted on the cluster`. Then the local
@@ -181,9 +182,7 @@ path is absent). Kinds:
 order, skipping any pair of subdirectories whose keys are equal, and
 expands an added or deleted directory into a change for the directory
 itself followed by one for each path below it. It is used for
-base→remote (status, pull, `diff --incoming`) and for remote→working
-copy (`diff --remote`, through the scan's result against base and then
-the tree diff, see below).
+base→remote (status, pull, `diff --incoming`).
 
 **Working directory against base** (the scan) walks the disk under
 `.amberignore` rules with the root's `.dstore` skipped, so that what
@@ -204,8 +203,10 @@ compared by re-encoding: inline when the encoding fits
 `ingest.DefaultXattrInlineMax`, otherwise as an `XattrSet` key.
 
 `diff --remote` compares the working directory to the fetched tree by
-composing the two: paths changed on either side are diffed content
-against content between the fetched tree and the disk.
+composing the two lists: every path named in either the scan
+(base→working directory) or the tree diff (base→remote) is compared
+entry against entry between the fetched tree and the disk, and only
+the paths that really differ are printed.
 
 ## Merge (pull)
 
@@ -261,8 +262,9 @@ directory only. `ScanWith(dir string, opts Opts)` honours `Exclude`,
 - `Change`, `Kind`, `DiffTrees(get, a, b)`, `Scan(root, base, get,
   syncedAt, jobs)`, `Merge(local, incoming) (apply, conflicts)`,
   `Apply(root, changes, get)`.
-- `Unified(w, changes, old, new Source, opts)` and `Stat(w, …)`, where a
-  `Source` reads a path's content either from a tree or from disk.
+- `Unified(w, changes, old, new Source)` and `Stat(w, changes, old,
+  new Source)`, where a `Source` reads a path's content either from a
+  tree or from disk.
 - The flows over a connected `*client.Cluster`: `Clone`, `Init`,
   `(*Tree).Fetch`, `Pull`, `Push`, `Status`, each returning a result
   struct the CLI prints. The CLI stays thin and the flows run against
