@@ -6,7 +6,7 @@ require (
 	charm.land/bubbles/v2 v2.2.1
 	charm.land/bubbletea/v2 v2.0.9
 	charm.land/lipgloss/v2 v2.0.6
-	github.com/amber-store/core v0.0.7
+	github.com/amber-store/core v0.0.8-0.20260915222045-989c7e89c366
 	github.com/amber-store/transport-iroh v0.4.0
 	github.com/aymanbagabas/go-udiff v0.4.1
 	github.com/cockroachdb/pebble/v2 v2.1.7
@@ -81,5 +81,3 @@ require (
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
-
-replace github.com/amber-store/core => /Users/dragan/jobs-build/amber-store-core
