@@ -80,3 +80,5 @@ require (
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
+
+replace github.com/amber-store/core => /Users/dragan/jobs-build/amber-store-core
