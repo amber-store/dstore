@@ -151,10 +151,11 @@ named `file`, `directory`, `symlink`, `fifo`, `socket`, `char device`,
 **diff.** Unified diffs of the working directory against base; with
 `--remote` against the fetched tree (the diff to the cluster's state);
 with `--incoming` base against the fetched tree (what pull would
-apply). The output is git-style: `--- a/PATH` and `+++ b/PATH` headers
-(`/dev/null` for an added or deleted file), `old mode NNNN` / `new mode
-NNNN` lines before them for a permission change (also for a directory,
-which then has no body), hunks from `go-udiff`. A symlink's target is
+apply). The output is git-style: a `diff a/PATH b/PATH` line, then
+`old mode NNNN` / `new mode NNNN` lines for a permission change (a
+directory's own change consists of these alone), then `--- a/PATH` and
+`+++ b/PATH` headers (`/dev/null` for an added or deleted file) and
+hunks from `go-udiff`. A symlink's target is
 its content, so a retargeted link is a one-line diff. Content that holds
 a NUL byte in its first 8 KiB, and files over 16 MiB on either side,
 are summarised: `Binary files a/PATH and b/PATH differ`. Metadata-only
@@ -181,8 +182,12 @@ path is absent). Kinds:
 **Tree against tree** walks two directory trees entry by entry in name
 order, skipping any pair of subdirectories whose keys are equal, and
 expands an added or deleted directory into a change for the directory
-itself followed by one for each path below it. It is used for
-base→remote (status, pull, `diff --incoming`).
+itself followed by one for each path below it. A type change is
+followed the same way: by *deleted* changes for the contents of a
+directory that became something else, and by *added* changes for the
+contents of a path that became a directory. It is used for base→remote
+(status, pull, `diff --incoming`); the scan below reports type changes
+identically.
 
 **Working directory against base** (the scan) walks the disk under
 `.amberignore` rules with the root's `.dstore` skipped, so that what
@@ -202,11 +207,9 @@ ingest reads them (`listxattr`/`getxattr`, `ENOTSUP` meaning none) and
 compared by re-encoding: inline when the encoding fits
 `ingest.DefaultXattrInlineMax`, otherwise as an `XattrSet` key.
 
-`diff --remote` compares the working directory to the fetched tree by
-composing the two lists: every path named in either the scan
-(base→working directory) or the tree diff (base→remote) is compared
-entry against entry between the fetched tree and the disk, and only
-the paths that really differ are printed.
+`diff --remote` runs the same scan with the fetched tree in place of
+base, so the working directory is compared to the cluster's state
+directly; the racy-mtime rule then uses the current time.
 
 ## Merge (pull)
 
@@ -223,6 +226,8 @@ Inputs: the local list (base→working directory) and the incoming list
   **apply** (the remote's metadata wins; no conflict);
 - a local deletion or type change of an ancestor directory while the
   remote adds or modifies below it: **conflict**;
+- an incoming type change of a directory while the local side changed
+  anything below it: **conflict**;
 - anything else: **conflict**.
 
 Local-only changes are kept. A file added locally inside a directory the
