@@ -72,7 +72,7 @@ func storeFlag() cli.Flag {
 }
 
 func ticketFlag() cli.Flag {
-	return &cli.StringFlag{Name: "ticket", Usage: "cluster ticket (dstore1…)", EnvVars: []string{"DSTORE_TICKET"}}
+	return &cli.StringFlag{Name: "ticket", Usage: "cluster ticket (dstore1…) or comma-separated node ids, found by discovery", EnvVars: []string{"DSTORE_TICKET"}}
 }
 
 // clientFlags are the flags of every command that dials the cluster.
@@ -81,7 +81,12 @@ func clientFlags() []cli.Flag {
 		ticketFlag(),
 		&cli.StringFlag{Name: "relay", Usage: "relay URL for the fallback path (default: the built-in relay map)"},
 		&cli.BoolFlag{Name: "no-relay", Usage: "direct addresses only, no relay"},
+		noDiscoveryFlag(),
 	}
+}
+
+func noDiscoveryFlag() cli.Flag {
+	return &cli.BoolFlag{Name: "no-discovery", Usage: "neither announce this endpoint nor resolve node ids by discovery (mDNS and, with relays, number0's DNS)", EnvVars: []string{"DSTORE_NO_DISCOVERY"}}
 }
 
 func netFlags() []cli.Flag {
@@ -91,6 +96,7 @@ func netFlags() []cli.Flag {
 		&cli.StringSliceFlag{Name: "advertise-addr", Usage: "direct address to advertise, ip or ip:port (repeatable)"},
 		&cli.BoolFlag{Name: "loopback", Usage: "advertise 127.0.0.1 only (single-machine tests)"},
 		&cli.StringFlag{Name: "bind", Usage: "UDP address to bind, ip:port"},
+		noDiscoveryFlag(),
 	}
 }
 
@@ -155,7 +161,8 @@ func bindNodeEndpoint(ctx context.Context, c *cli.Context, dir string) (*transpo
 	if err != nil {
 		return nil, err
 	}
-	cfg := transport.IrohConfig{SecretKey: sk, ALPNs: []string{wire.ALPNClient, wire.ALPNCluster}, RelayMode: rm, Loopback: c.Bool("loopback")}
+	discover := !c.Bool("no-discovery")
+	cfg := transport.IrohConfig{SecretKey: sk, ALPNs: []string{wire.ALPNClient, wire.ALPNCluster}, RelayMode: rm, Loopback: c.Bool("loopback"), Discover: discover, Announce: discover, Logger: logger(c)}
 	if vals := c.StringSlice("advertise-addr"); len(vals) > 0 {
 		cfg.Advertise = []netip.AddrPort{}
 		for _, v := range vals {
@@ -319,29 +326,36 @@ func clusterCmd() *cli.Command {
 			},
 			{
 				Name:  "ticket",
-				Usage: "print the bootstrap ticket",
-				Flags: append(clientFlags(), storeFlag()),
+				Usage: "print the bootstrap ticket, or with --ids the member ids to hand out instead",
+				Flags: append(clientFlags(), storeFlag(), &cli.BoolFlag{Name: "ids", Usage: "print comma-separated node ids (the short form, found by discovery)"}),
 				Action: func(c *cli.Context) error {
 					ctx, cancel := signalCtx()
 					defer cancel()
+					var t ticket.Ticket
 					if c.String("ticket") == "" && c.String("store") != "" {
-						t, err := localTicket(c.String("store"))
+						var err error
+						if t, err = localTicket(c.String("store")); err != nil {
+							return err
+						}
+					} else {
+						cl, err := dialCluster(ctx, c)
 						if err != nil {
 							return err
 						}
+						defer cl.Close()
+						r, err := admin(ctx, cl, node.AdminRequest{Op: "cluster-ticket"})
+						if err != nil {
+							return err
+						}
+						if t, err = ticket.Parse(r.Ticket); err != nil {
+							return err
+						}
+					}
+					if c.Bool("ids") {
+						fmt.Println(t.IDs())
+					} else {
 						fmt.Println(t.Encode())
-						return nil
 					}
-					cl, err := dialCluster(ctx, c)
-					if err != nil {
-						return err
-					}
-					defer cl.Close()
-					r, err := admin(ctx, cl, node.AdminRequest{Op: "cluster-ticket"})
-					if err != nil {
-						return err
-					}
-					fmt.Println(r.Ticket)
 					return nil
 				},
 			},
@@ -463,7 +477,7 @@ func nodeCmd() *cli.Command {
 				Name:  "join",
 				Usage: "join a cluster with this store and keep serving",
 				Flags: append(nodeFlags(),
-					&cli.StringFlag{Name: "seed", Required: true, Usage: "cluster ticket"},
+					&cli.StringFlag{Name: "seed", Required: true, Usage: "cluster ticket (dstore1…) or comma-separated node ids, found by discovery"},
 					&cli.StringFlag{Name: "token", Required: true, Usage: "join token (hex)"},
 					&cli.StringFlag{Name: "weight", Value: "auto", Usage: "capacity in GiB, or auto"},
 					&cli.StringFlag{Name: "zone"},

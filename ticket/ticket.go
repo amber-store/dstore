@@ -1,15 +1,18 @@
-// Package ticket encodes the cluster ticket clients bootstrap from
-// (architecture/dstore.md §5.5): "dstore1" followed by base32 CBOR of the
-// cluster id, its incarnation and the addresses of a few members.
+// Package ticket encodes what clients bootstrap from (architecture/dstore.md
+// §5.5): the cluster ticket, "dstore1" followed by base32 CBOR of the
+// cluster id, its incarnation and the addresses of a few members, or the
+// short form, a list of member ids whose addresses discovery finds.
 package ticket
 
 import (
 	"encoding/base32"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/amber-store/dstore/codec"
+	irohkey "github.com/tmc/go-iroh/key"
 )
 
 // Prefix is the ticket's textual prefix.
@@ -37,11 +40,28 @@ func (t Ticket) Encode() string {
 
 func (t Ticket) String() string { return t.Encode() }
 
-// Parse decodes a ticket.
+// IDs returns the short form: the members' ids in hex, comma-separated.
+// It parses back to a ticket whose members have no addresses.
+func (t Ticket) IDs() string {
+	ids := make([]string, 0, len(t.Members))
+	for _, m := range t.Members {
+		if len(m.ID) == 32 {
+			ids = append(ids, hex.EncodeToString(m.ID))
+		}
+	}
+	return strings.Join(ids, ",")
+}
+
+// Parse decodes a ticket: the dstore1… form, or a list of node ids
+// separated by commas or whitespace, each 64 hex characters or iroh's
+// 52-character base32 form, naming members to find by discovery.
 func Parse(s string) (Ticket, error) {
 	s = strings.TrimSpace(s)
+	if s == "" {
+		return Ticket{}, errors.New("ticket: empty")
+	}
 	if !strings.HasPrefix(strings.ToLower(s), Prefix) {
-		return Ticket{}, errors.New("ticket: missing dstore1 prefix")
+		return parseIDs(s)
 	}
 	b, err := enc.DecodeString(strings.ToUpper(s[len(Prefix):]))
 	if err != nil {
@@ -50,6 +70,22 @@ func Parse(s string) (Ticket, error) {
 	var t Ticket
 	if err := codec.Unmarshal(b, &t); err != nil {
 		return Ticket{}, fmt.Errorf("ticket: %w", err)
+	}
+	if len(t.Members) == 0 {
+		return Ticket{}, errors.New("ticket: no members")
+	}
+	return t, nil
+}
+
+func parseIDs(s string) (Ticket, error) {
+	var t Ticket
+	for _, f := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r' }) {
+		id, err := irohkey.ParseEndpointID(strings.ToLower(f))
+		if err != nil {
+			return Ticket{}, fmt.Errorf("ticket: %q is neither a dstore1 ticket nor a node id: %w", f, err)
+		}
+		b := id.Bytes()
+		t.Members = append(t.Members, Member{ID: b[:]})
 	}
 	if len(t.Members) == 0 {
 		return Ticket{}, errors.New("ticket: no members")

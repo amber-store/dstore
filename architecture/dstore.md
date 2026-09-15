@@ -651,9 +651,21 @@ hold it (§5.3).
   optimisation: nothing is correct only because gossip delivered.
 - **Clients** bootstrap from a **cluster ticket** — `dstore cluster
   ticket` prints `dstore1` followed by base32 CBOR of `{cluster_id,
-  incarnation, addrs of a few members}` — dial any of the members, ask
-  `view`, cache it with `(incarnation, epoch)`, and refresh on
-  `stale-view`. They never need the catalog protocol. A node
+  incarnation, addrs of a few members}` — or from the **ids of one or
+  more members** (`dstore cluster ticket --ids`; 64 hex characters each,
+  comma-separated), whose addresses the endpoint finds by discovery:
+  every node announces its direct addresses over mDNS on its link and,
+  when relays are enabled, publishes a pkarr record at number0's DNS
+  service carrying its relay URL and direct addresses; a client dialing
+  an id without addresses asks mDNS and that DNS service concurrently
+  and dials the first usable answer. The ticket needs no discovery
+  infrastructure and stays the form for isolated networks. Either way
+  the client dials any of the members, asks
+  `view`, caches it with `(incarnation, epoch)`, and refreshes on
+  `stale-view`; from then on the view supplies every member's addresses,
+  and discovery is only the fallback for a member whose listed addresses
+  all fail. Clients only resolve and never announce, so an ephemeral
+  client identity is published nowhere. They never need the catalog protocol. A node
   that sees a request claiming an epoch above its own refreshes through a
   single-flight read at most every 100 ms, and answers `bad-request` if
   the catalog does not confirm such an epoch — one misconfigured client
