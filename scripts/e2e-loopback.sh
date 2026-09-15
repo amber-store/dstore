@@ -1,6 +1,7 @@
 #!/bin/sh
 # Runs three dstore nodes over real iroh endpoints on the loopback
-# interface (no relays), pushes a tree, reads it back, runs a GC cycle.
+# interface (no relays), pushes a tree, reads it back, runs a GC cycle,
+# and checks that a watch saw the push and the delete.
 # Everything lives under a temporary directory that is removed on exit.
 set -eu
 W=$(mktemp -d "${TMPDIR:-/tmp}/dstore-e2e.XXXXXX")
@@ -34,6 +35,9 @@ done
 cat status.out
 grep -q 'nodes 3 voters 3' status.out || { echo "cluster did not reach 3 nodes / 3 voters"; cat n2.log n3.log; exit 1; }
 
+TAB=$(printf '\t')
+$B watch --no-relay 'trees/**' > watch.out 2> watch.err &
+sleep 2
 $B push --local local1 --user e2e --no-relay src trees/demo
 $B refs --no-relay
 $B ls --no-relay trees/demo sub | grep -q g.bin
@@ -42,5 +46,8 @@ $B pull --local local2 --no-relay trees/demo
 $B ref get --no-relay trees/demo
 $B gc run --no-relay
 $B ref delete --no-relay trees/demo
-$B refs --no-relay | grep -qv '^trees/demo' 
+$B refs --no-relay | grep -qv '^trees/demo'
+i=0; while [ $i -lt 20 ]; do grep -q "^trees/demo${TAB}deleted" watch.out && break; sleep 0.5; i=$((i+1)); done
+grep -q "^trees/demo${TAB}[0-9a-f]" watch.out || { echo "watch missed the push"; cat watch.out watch.err; exit 1; }
+grep -q "^trees/demo${TAB}deleted" watch.out || { echo "watch missed the delete"; cat watch.out watch.err; exit 1; }
 echo "E2E OK"

@@ -26,7 +26,7 @@ ballot), so a client can order what it sees.
 ## How a node learns of a change
 
 **Coordinator hint plus periodic reconcile.** The node that commits a
-`ref-put` or `ref-delete` broadcasts `ref-changed {name, key?, version}`
+`ref-put` or `ref-delete` broadcasts `ref-changed {name, record?, version}`
 to every member on the cluster ALPN — the same fire-and-forget broadcast
 as `view-changed` — and applies it to its own watchers. Each watch
 stream also re-scans its pattern's prefix every `WatchReconcile`
@@ -71,7 +71,7 @@ Cluster ALPN `amber-dstore-cluster/1`:
 
 | op | purpose |
 |---|---|
-| `ref-changed {name, key?, version}` → `ack` | a reference changed; key absent for a deletion (hint) |
+| `ref-changed {name, record?, version}` → `ack` | a reference changed; record absent for a deletion (hint) |
 
 Frame numbers: `ref-watch` 42, `ref-changes` 59, `ref-synced` 60,
 `ref-changed` 108. New `Msg` fields: `pattern` (60), `deleted` (61). The
@@ -99,9 +99,10 @@ optional and ignored). A known list must fit one frame (16 MiB, about
   version is ignored (a hint got ahead of a lagging voter's row). A scan
   compares keys for names the client sent without a version.
 - Every path that commits a reference write calls `refChanged(name,
-  key, version)`: `handleRefPut`, `handleRefDelete` (when a tombstone was
-  written), `RefPutLocal`, the catalog restore. It applies the hint
-  locally and broadcasts `ref-changed`. The `ref-changed` handler on the
+  record, version)`: `handleRefPut`, `handleRefDelete` (when a tombstone
+  was written), `RefPutLocal` (which the hourly catalog backup uses). It
+  applies the hint locally and broadcasts `ref-changed`. The catalog
+  restore runs on an offline node; the reconcile covers it. The `ref-changed` handler on the
   cluster ALPN applies the hint and answers `ack`.
 - `Config.WatchReconcile`, default 30 s.
 
@@ -109,8 +110,9 @@ optional and ignored). A known list must fit one frame (16 MiB, about
 
 `Cluster.WatchRefs(ctx, pattern, known map[string][]byte) iter.Seq2[RefChange, error]`.
 
-- `RefChange{Name, Key, Version, CreatedAt, User, Deleted, Synced}`.
-  `Synced` is yielded once after each connection's initial difference.
+- `RefChange{Name, Key, Version, CreatedAt, User, Deleted, Synced, Node}`.
+  `Synced` is yielded once after each connection's initial difference,
+  with `Node` naming the serving node.
 - The iterator copies `known` and keeps it current from the changes it
   yields.
 - It picks a node in the usual preference order, opens a stream, writes

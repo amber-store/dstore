@@ -28,6 +28,7 @@ for filesystem trees, reachable over [iroh](https://iroh.computer).
 | `wire` | the frame format and message types of both ALPNs; reuses transport-iroh's pack framing (§10) |
 | `paxos` | CASPaxos: a Pebble-backed acceptor with epoch gating, amnesia and purge floors; a proposer with CAS, fast reads, identity transitions and majority scans (§5.3) |
 | `catalog` | typed registers over the proposer: view, references with versions and tombstones, lease, GC state, join tokens (§5.2) |
+| `refglob` | path-style globs over reference names, for `ref-watch` (§7) |
 | `transport` | the stream abstraction the node and client are written against, with an iroh implementation and an in-memory network for one-process clusters (§16) |
 | `meta` | a node's bookkeeping database (§6.1) |
 | `node` | the storage node: both ALPNs, the data path with primary forwarding, reference coordination, the lease-driven coordinator, voter changes with sync, transitions with the reconcile pass, garbage collection (§6–§9) |
@@ -50,6 +51,7 @@ dstore node join --store /srv/n2 --seed dstore1… --token <hex> --weight auto
 dstore push --ticket dstore1… --local ~/.amber ./tree trees/demo
 dstore pull --ticket dstore1… --local ~/.amber trees/demo
 dstore refs --ticket dstore1…
+dstore watch --ticket dstore1… 'trees/**'   # prints each change until Ctrl+C
 dstore ls  --ticket dstore1… trees/demo sub
 dstore cat --ticket dstore1… trees/demo hello.txt
 
@@ -132,6 +134,9 @@ Implemented, against the spec's milestones:
   failure handling.
 - **M4 (partly)** — the hourly catalog backup as an object plus the
   reserved reference, `catalog restore`.
+- **Reference watching** (§7) — `ref-watch` streams with coordinator
+  hints and a periodic reconcile, `WatchRefs` in the client library
+  with reconnection, `dstore watch`.
 
 Deviations forced by the current `core` (its §15 items are not there
 yet), to be revisited when they land:

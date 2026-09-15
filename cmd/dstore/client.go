@@ -341,6 +341,43 @@ func refsCmd() *cli.Command {
 	}
 }
 
+func watchCmd() *cli.Command {
+	return &cli.Command{
+		Name:      "watch",
+		Usage:     "watch references matching a glob and print each change until interrupted",
+		ArgsUsage: "PATTERN",
+		Description: "PATTERN is path-style: * and ? match within one /-separated segment, ** as a whole segment matches any number of segments, [...] is a character class.\n" +
+			"Every matching reference is printed first, then each change as it happens: NAME<TAB>KEY<TAB>CREATED<TAB>USER, or NAME<TAB>deleted.",
+		Flags: clientFlags(),
+		Action: func(c *cli.Context) error {
+			pattern := c.Args().First()
+			if pattern == "" {
+				return errors.New("watch PATTERN")
+			}
+			ctx, cancel := signalCtx()
+			defer cancel()
+			cl, err := dialCluster(ctx, c)
+			if err != nil {
+				return err
+			}
+			defer cl.Close()
+			for ch, err := range cl.WatchRefs(ctx, pattern, nil) {
+				if err != nil {
+					return err
+				}
+				switch {
+				case ch.Synced:
+				case ch.Deleted:
+					fmt.Printf("%s\tdeleted\n", ch.Name)
+				default:
+					fmt.Printf("%s\t%x\t%s\t%s\n", ch.Name, ch.Key, time.Unix(0, ch.CreatedAt).Format(time.RFC3339), ch.User)
+				}
+			}
+			return nil
+		},
+	}
+}
+
 func refCmd() *cli.Command {
 	return &cli.Command{
 		Name:  "ref",
