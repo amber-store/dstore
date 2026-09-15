@@ -42,6 +42,17 @@ func dialCluster(ctx context.Context, c *cli.Context) (*client.Cluster, error) {
 	return dialClusterLog(ctx, c, logger(c))
 }
 
+// netOpts are the connection options of a client command.
+type netOpts struct {
+	Relay       string
+	NoRelay     bool
+	NoDiscovery bool
+}
+
+func netOptsOf(c *cli.Context) netOpts {
+	return netOpts{Relay: c.String("relay"), NoRelay: c.Bool("no-relay"), NoDiscovery: c.Bool("no-discovery")}
+}
+
 // dialClusterLog is dialCluster with the client logging to log.
 func dialClusterLog(ctx context.Context, c *cli.Context, log *slog.Logger) (*client.Cluster, error) {
 	var t ticket.Ticket
@@ -59,15 +70,20 @@ func dialClusterLog(ctx context.Context, c *cli.Context, log *slog.Logger) (*cli
 	} else {
 		return nil, errors.New("no cluster: set --ticket or $DSTORE_TICKET")
 	}
+	return dialTicket(ctx, t, netOptsOf(c), log)
+}
+
+// dialTicket connects to the cluster of t with an ephemeral identity.
+func dialTicket(ctx context.Context, t ticket.Ticket, n netOpts, log *slog.Logger) (*client.Cluster, error) {
 	sk, err := irohkey.GenerateSecretKey()
 	if err != nil {
 		return nil, err
 	}
-	rm, err := relayMode(c)
+	rm, err := relayModeOf(n.Relay, n.NoRelay)
 	if err != nil {
 		return nil, err
 	}
-	ep, err := transport.BindIroh(ctx, transport.IrohConfig{SecretKey: sk, RelayMode: rm, Discover: !c.Bool("no-discovery"), Logger: log})
+	ep, err := transport.BindIroh(ctx, transport.IrohConfig{SecretKey: sk, RelayMode: rm, Discover: !n.NoDiscovery, Logger: log})
 	if err != nil {
 		return nil, err
 	}
@@ -204,7 +220,17 @@ func openLocal(c *cli.Context) (*packstore.Store, *refstore.Store, error) {
 	return st, refs, nil
 }
 
-func pushCmd() *cli.Command {
+// storeCmd holds the commands over a standalone local store (the amber
+// layout <dir>/packstore, <dir>/refs), as opposed to a working copy.
+func storeCmd() *cli.Command {
+	return &cli.Command{
+		Name:        "store",
+		Usage:       "push and pull between a standalone local store and the cluster",
+		Subcommands: []*cli.Command{storePushCmd(), storePullCmd()},
+	}
+}
+
+func storePushCmd() *cli.Command {
 	return &cli.Command{
 		Name:      "push",
 		Usage:     "build a tree from PATH into the local store and push it under NAME",
@@ -274,7 +300,7 @@ func pushCmd() *cli.Command {
 	}
 }
 
-func pullCmd() *cli.Command {
+func storePullCmd() *cli.Command {
 	return &cli.Command{
 		Name:      "pull",
 		Usage:     "pull the tree under NAME into the local store",
