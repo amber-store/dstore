@@ -40,13 +40,15 @@ func (t Ticket) Encode() string {
 
 func (t Ticket) String() string { return t.Encode() }
 
-// IDs returns the short form: the members' ids in hex, comma-separated.
-// It parses back to a ticket whose members have no addresses.
+// IDs returns the short form: the members' ids in hex, comma-separated,
+// each once. It parses back to a ticket whose members have no addresses.
 func (t Ticket) IDs() string {
 	ids := make([]string, 0, len(t.Members))
+	seen := map[string]bool{}
 	for _, m := range t.Members {
-		if len(m.ID) == 32 {
-			ids = append(ids, hex.EncodeToString(m.ID))
+		if id := hex.EncodeToString(m.ID); len(m.ID) == 32 && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
 		}
 	}
 	return strings.Join(ids, ",")

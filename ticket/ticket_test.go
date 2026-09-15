@@ -70,7 +70,7 @@ func TestParseIDs(t *testing.T) {
 			t.Fatalf("Parse(%q) succeeded", s)
 		}
 	}
-	tk, _ := Parse(hex1 + "," + hex2)
+	tk, _ := Parse(hex1 + "," + hex2 + "," + hex1)
 	if got := tk.IDs(); got != hex1+","+hex2 {
 		t.Fatalf("IDs() = %q", got)
 	}
