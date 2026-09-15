@@ -215,9 +215,19 @@ func TestScanMergeAndSettle(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// Plant a minority-accepted value directly on one acceptor.
+	// A proposer at ballot 1000 got promises from a majority (acceptors 1
+	// and 2) and its accept reached only acceptor 1 before it died: a
+	// minority-accepted value (§5.3).
+	reg := []byte("ref/05")
 	b := Ballot{Counter: 1000, Proposer: nid(2)}
-	accs[0].Handle(&wire.Msg{Type: wire.TAccept, Incarnation: 1, Epoch: 1, Reg: []byte("ref/05"), Ballot: b.Bytes(), Value: []byte("rogue"), HasValue: true})
+	for _, a := range accs[:2] {
+		if r := a.Handle(&wire.Msg{Type: wire.TPrepare, Incarnation: 1, Epoch: 1, Reg: reg, Ballot: b.Bytes()}); r.Type != wire.TPromise {
+			t.Fatalf("prepare: %+v", r)
+		}
+	}
+	if r := accs[0].Handle(&wire.Msg{Type: wire.TAccept, Incarnation: 1, Epoch: 1, Reg: reg, Ballot: b.Bytes(), Value: []byte("rogue"), HasValue: true}); r.Type != wire.TAccepted {
+		t.Fatalf("accept: %+v", r)
+	}
 
 	rows, next, err := p.Scan(ctx, []byte("ref/"), nil, 100)
 	if err != nil {
@@ -229,25 +239,63 @@ func TestScanMergeAndSettle(t *testing.T) {
 	if len(rows) != 10 {
 		t.Fatalf("%d rows", len(rows))
 	}
-	undecided := 0
 	for _, r := range rows {
-		if r.Undecided {
-			undecided++
-			if string(r.Reg) != "ref/05" {
-				t.Fatalf("undecided %s", r.Reg)
-			}
-			settled, err := p.Settle(ctx, r.Reg)
-			if err != nil {
-				t.Fatal(err)
-			}
-			// The higher-ballot minority value is what a settle adopts.
-			if string(settled.Value) != "rogue" {
-				t.Fatalf("settled to %q", settled.Value)
-			}
+		if r.Undecided != (string(r.Reg) == "ref/05") {
+			t.Fatalf("%s undecided=%v", r.Reg, r.Undecided)
+		}
+		if string(r.Reg) == "ref/05" && (string(r.Row.Value) != "rogue" || r.Row.Accepted.Compare(b) != 0) {
+			t.Fatalf("merged row %+v, want the highest accepted", r.Row)
 		}
 	}
-	if undecided != 1 {
-		t.Fatalf("%d undecided", undecided)
+
+	// A settle adopts the highest accepted value among the quorum that
+	// answers its prepare, at a ballot above every promise it meets. Which
+	// two acceptors answer first is a race, so pin the quorum: with
+	// acceptor 3 down it must include acceptor 1, and the rogue wins.
+	tr.down[nid(3)] = true
+	settled, err := p.Settle(ctx, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(settled.Value) != "rogue" || settled.Accepted.Compare(b) <= 0 {
+		t.Fatalf("settled to %q at %s", settled.Value, settled.Accepted)
+	}
+	tr.down[nid(3)] = false
+	// Acceptor 3 missed that accept. The next settle finds the decided
+	// value on any quorum and carries it to every voter; once its accept
+	// has landed everywhere, reads and scans agree and nothing is
+	// undecided.
+	if settled, err = p.Settle(ctx, reg); err != nil || string(settled.Value) != "rogue" {
+		t.Fatalf("resettle: %+v %v", settled, err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		all := p.ReadAll(ctx, reg)
+		agree := len(all) == 3
+		for _, r := range all {
+			if r.Accepted.Compare(settled.Accepted) != 0 || string(r.Value) != "rogue" {
+				agree = false
+			}
+		}
+		if agree {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("voters did not converge: %+v", all)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if row, err := p.Read(ctx, reg); err != nil || string(row.Value) != "rogue" {
+		t.Fatalf("read after settle: %+v %v", row, err)
+	}
+	rows, _, err = p.Scan(ctx, []byte("ref/"), nil, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		if r.Undecided {
+			t.Fatalf("%s still undecided after settle", r.Reg)
+		}
 	}
 	// Paging.
 	rows, next, err = p.Scan(ctx, []byte("ref/"), nil, 4)
@@ -257,6 +305,48 @@ func TestScanMergeAndSettle(t *testing.T) {
 	rows2, _, err := p.Scan(ctx, []byte("ref/"), next, 100)
 	if err != nil || len(rows2) != 6 {
 		t.Fatalf("page 2: %d rows err=%v", len(rows2), err)
+	}
+}
+
+// TestSettleWithoutTheMinorityAcceptor is the other quorum: when the
+// acceptor holding the minority-accepted value is down, the settle keeps
+// the value the majority agrees on, still at a ballot above the promise
+// the majority gave — so the lost value can never be chosen later.
+func TestSettleWithoutTheMinorityAcceptor(t *testing.T) {
+	tr, v, accs := cluster(t, 3)
+	p := proposer(tr, v, 1)
+	ctx := context.Background()
+	reg := []byte("ref/x")
+	if _, err := p.Propose(ctx, reg, func(Row, Ballot) ([]byte, bool, error) { return []byte("old"), true, nil }, 0); err != nil {
+		t.Fatal(err)
+	}
+	b := Ballot{Counter: 1000, Proposer: nid(2)}
+	for _, a := range accs[:2] {
+		a.Handle(&wire.Msg{Type: wire.TPrepare, Incarnation: 1, Epoch: 1, Reg: reg, Ballot: b.Bytes()})
+	}
+	accs[0].Handle(&wire.Msg{Type: wire.TAccept, Incarnation: 1, Epoch: 1, Reg: reg, Ballot: b.Bytes(), Value: []byte("rogue"), HasValue: true})
+
+	tr.down[nid(1)] = true
+	rows, _, err := p.Scan(ctx, []byte("ref/"), nil, 100)
+	if err != nil || len(rows) != 1 || !rows[0].Undecided {
+		t.Fatalf("scan: %+v %v (a promise above the accepted ballot is undecided)", rows, err)
+	}
+	settled, err := p.Settle(ctx, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(settled.Value) != "old" || settled.Accepted.Compare(b) <= 0 {
+		t.Fatalf("settled to %q at %s", settled.Value, settled.Accepted)
+	}
+	tr.down[nid(1)] = false
+	// Acceptor 1 still holds the rogue at 1000, below the settle's ballot,
+	// so any later read converges on the settled value.
+	row, err := p.Settle(ctx, reg)
+	if err != nil || string(row.Value) != "old" {
+		t.Fatalf("resettle: %+v %v", row, err)
+	}
+	if row, err := p.Read(ctx, reg); err != nil || string(row.Value) != "old" {
+		t.Fatalf("read: %+v %v", row, err)
 	}
 }
 
