@@ -21,6 +21,7 @@ import (
 	"github.com/amber-store/dstore/transport"
 	"github.com/amber-store/dstore/view"
 	"github.com/amber-store/dstore/wire"
+	"github.com/amber-store/dstore/worktree"
 	irohkey "github.com/tmc/go-iroh/key"
 	"github.com/tmc/go-iroh/netaddr"
 	"github.com/tmc/go-iroh/relay"
@@ -40,7 +41,8 @@ func main() {
 		},
 		Commands: []*cli.Command{
 			clusterCmd(), serveCmd(), tokenCmd(), nodeCmd(), voterCmd(), transitionCmd(), gcCmd(), catalogCmd(),
-			pushCmd(), pullCmd(), refsCmd(), watchCmd(), refCmd(), lsCmd(), catCmd(),
+			storeCmd(), cloneCmd(), initCmd(), fetchCmd(), pullCmd(), pushCmd(), statusCmd(), diffCmd(),
+			refsCmd(), watchCmd(), refCmd(), lsCmd(), catCmd(),
 		},
 	}
 	if err := app.Run(os.Args); err != nil {
@@ -115,10 +117,14 @@ func nodeFlags() []cli.Flag {
 }
 
 func relayMode(c *cli.Context) (*relay.Mode, error) {
-	if c.Bool("no-relay") {
+	return relayModeOf(c.String("relay"), c.Bool("no-relay"))
+}
+
+func relayModeOf(url string, noRelay bool) (*relay.Mode, error) {
+	if noRelay {
 		return nil, nil
 	}
-	if u := c.String("relay"); u != "" {
+	if u := url; u != "" {
 		ru, err := netaddr.ParseRelayURL(u)
 		if err != nil {
 			return nil, err
@@ -395,14 +401,7 @@ func localTicket(dir string) (ticket.Ticket, error) {
 	if v == nil {
 		return ticket.Ticket{}, errors.New("this store is not a member of a cluster")
 	}
-	t := ticket.Ticket{ClusterID: v.ClusterID, Incarnation: v.Incarnation}
-	for _, nd := range v.Nodes {
-		t.Members = append(t.Members, ticket.Member{ID: nd.ID, Addrs: nd.Addrs})
-		if len(t.Members) >= 4 {
-			break
-		}
-	}
-	return t, nil
+	return worktree.TicketFromView(v), nil
 }
 
 // ---- serve / join ----

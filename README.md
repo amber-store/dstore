@@ -33,6 +33,7 @@ for filesystem trees, reachable over [iroh](https://iroh.computer).
 | `meta` | a node's bookkeeping database (§6.1) |
 | `node` | the storage node: both ALPNs, the data path with primary forwarding, reference coordination, the lease-driven coordinator, voter changes with sync, transitions with the reconcile pass, garbage collection (§6–§9) |
 | `client` | the cluster handle: view cache, owner preference by path, `Missing`/`Put`/`Get`, tree push and pull (§11) |
+| `worktree` | working copies: a directory holding one reference's tree with a local packstore and state in `.dstore/`; scan, tree diff, three-way merge, applier, unified diffs, and the clone/fetch/pull/push flows (§11.7) |
 | `ticket` | the `dstore1…` bootstrap ticket and its short form, a list of node ids (§5.5) |
 | `cmd/dstore` | the CLI (§13) |
 
@@ -48,8 +49,8 @@ dstore token create --ticket dstore1…
 dstore node join --store /srv/n2 --seed dstore1… --token <hex> --weight auto
 
 # clients: --ticket takes the ticket or the ids `cluster ticket --ids` prints
-dstore push --ticket dstore1… --local ~/.amber ./tree trees/demo
-dstore pull --ticket dstore1… --local ~/.amber trees/demo
+dstore store push --ticket dstore1… --local ~/.amber ./tree trees/demo   # from a standalone local store
+dstore store pull --ticket dstore1… --local ~/.amber trees/demo
 dstore refs --ticket dstore1…
 dstore watch --ticket dstore1… 'trees/**'   # prints each change until Ctrl+C
 dstore ls  --ticket dstore1… trees/demo sub
@@ -111,6 +112,37 @@ flight, bytes, rate) and the client's last events; Ctrl+C cancels the
 transfer cleanly. `--no-tui` (or `DSTORE_NO_TUI=1`) prints plain log
 lines and a status line every five seconds instead, which is also what a
 non-terminal stderr gets.
+
+## Working copies
+
+A reference can be worked on like a git branch without history:
+
+```
+dstore clone --ticket dstore1… trees/demo [DIR]   # DIR defaults to "demo"
+cd demo
+dstore status                    # new, modified, deleted, type and mode changes since the last sync
+dstore diff [--stat] [PATH…]     # unified diffs against the last synced tree
+dstore fetch                     # learn the cluster's current tree
+dstore diff --incoming           # what pull would apply; --remote: against the fetched tree
+dstore pull [--force]            # apply the cluster's changes, keeping local ones
+dstore push [--force] [--user U] # build, upload, write the reference under CAS
+dstore init --ticket dstore1… trees/new   # make an existing directory a working copy; push creates the reference
+```
+
+The directory's `.dstore/` holds a packstore with every tree fetched or
+pushed, the config (ticket, name, connection flags, user) and the state:
+the tree the directory was last synced to and the tree last fetched, with
+its version. `status` and `diff` work offline against those. A stored
+ticket takes precedence over `$DSTORE_TICKET`; `--ticket` overrides it for
+one run; the stored ticket is refreshed from the cluster view after every
+successful connection. `push` refuses when the fetched tree moved away
+from the synced one and when the reference changed on the cluster since
+the last fetch, so nothing is overwritten unseen; `pull` merges per path
+and refuses on a path changed on both sides unless `--force`. Paths that
+`.amberignore` hides are invisible to `status` and never pushed. A
+`touch` shows up only in a count of metadata-only differences, but is
+recorded by the next push. `.dstore/packstore` grows with every fetch and
+push; there is no local compaction yet.
 
 ## Tests
 
