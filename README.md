@@ -115,7 +115,7 @@ non-terminal stderr gets.
 
 ## Working copies
 
-A reference can be worked on like a git branch without history:
+A reference can be worked on like a git branch:
 
 ```
 dstore clone --ticket dstore1… trees/demo [DIR]   # DIR defaults to "demo"
@@ -125,7 +125,7 @@ dstore diff [--stat] [PATH…]     # unified diffs against the last synced tree
 dstore fetch                     # learn the cluster's current tree
 dstore diff --incoming           # what pull would apply; --remote: against the fetched tree
 dstore pull [--force]            # apply the cluster's changes, keeping local ones
-dstore push [--force] [--user U] # build, upload, write the reference under CAS
+dstore push [--force] [--user U] [-m MSG]  # build, upload, write the reference under CAS
 dstore init --ticket dstore1… trees/new   # make an existing directory a working copy; push creates the reference
 ```
 
@@ -143,6 +143,14 @@ and refuses on a path changed on both sides unless `--force`. Paths that
 `touch` shows up only in a count of metadata-only differences, but is
 recorded by the next push. `.dstore/packstore` grows with every fetch and
 push; there is no local compaction yet.
+
+A reference that names a commit (core object type 5, made by
+`amber-store commit create` or by `push -m`) is a branch. Clone, fetch and
+pull take the commit's tree and bring its history along; each `push` on a
+branch records a new commit with the fetched one as parent, the user as
+author and `-m` as the message, so the cluster keeps the whole history
+alive. A message on a plain reference turns it into a branch. `ls` and
+`cat` accept a branch too.
 
 ## Tests
 

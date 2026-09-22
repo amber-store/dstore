@@ -1453,8 +1453,14 @@ elif k ∈ visited:                done                            // exact prun
 else: visited += k; deliver(k)
       data = local Get(k), else Get from k's other owners (ranked retries)
       if absent everywhere: missing += k; done
-      enqueue fstree.ChildKeys(k, data)
+      enqueue fstree.ChildKeys(k, data)        // a Commit yields its tree, then its parents
 ```
+
+Because `ChildKeys` follows a Commit (core object type 5) to its tree and
+its parent commits, a reference that names a commit keeps the commit's
+whole ancestry live; the same walk drives the reference completeness checks and
+pulls, so transfers carry the history too. A node verifies a Commit's
+length field as its own serialized length, the Blob/XattrSet rule.
 
 Batches (`gc-keys {g, nonce, seq, keys[], expand: bool}`, ≤ 8192 keys,
 flushed every 50 ms) are accepted only from acked nodes at epoch `g`;
@@ -2013,6 +2019,17 @@ compare-and-swap on the fetched version, refusing when base and remote
 differ. Metadata-only differences (mtime, ownership, xattrs) are counted,
 not listed, and recorded by the next push. Design:
 `docs/superpowers/specs/2026-09-15-working-copy-design.md`.
+
+A reference that names a Commit is a *branch*. Fetch pulls the commit with
+its history and records the commit beside its tree (`remote_commit` in the
+state file); base and remote stay trees, so status, diff and pull are
+unchanged. On a branch, `push` wraps the ingested tree in a new commit
+whose single parent is the fetched commit (the user as author and
+committer, `--message` as its message) and moves the reference to it; a
+message on a plain or new reference makes a root commit and so starts a
+branch. A retried push after a lost state write is recognised when the
+cluster's commit, found in the local packstore, records the same tree and
+parents. `ls` and `cat` read a commit's tree.
 
 ## 12. Failure catalogue
 

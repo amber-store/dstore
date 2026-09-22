@@ -2,6 +2,7 @@ package worktree
 
 import (
 	"errors"
+	"github.com/amber-store/core/commit"
 	"os"
 	"path/filepath"
 	"testing"
@@ -39,6 +40,15 @@ func TestCreateOpenRoundTrip(t *testing.T) {
 	}
 	tr.State.HasRemote = true
 	tr.State.Remote = empty
+	id := commit.Identity{Name: "tester", When: 1}
+	branch, raw, err := commit.Commit{Tree: empty, Author: id, Committer: id}.Object()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.Store.Put(branch, raw); err != nil {
+		t.Fatal(err)
+	}
+	tr.State.RemoteCommit = branch
 	tr.State.RemoteVersion = []byte{1, 2, 3}
 	tr.State.SyncedAt = time.Unix(1_700_000_000, 5).UTC()
 	if err := tr.SaveState(); err != nil {
@@ -60,6 +70,9 @@ func TestCreateOpenRoundTrip(t *testing.T) {
 	}
 	if got.Config != cfg {
 		t.Fatalf("Config = %+v, want %+v", got.Config, cfg)
+	}
+	if !got.State.IsBranch() || got.State.RemoteCommit != branch || got.State.RemoteKey() != branch {
+		t.Fatalf("branch state = %+v", got.State)
 	}
 	if !got.State.HasRemote || got.State.Remote != empty || string(got.State.RemoteVersion) != "\x01\x02\x03" || !got.State.SyncedAt.Equal(time.Unix(1_700_000_000, 5)) {
 		t.Fatalf("State = %+v", got.State)
