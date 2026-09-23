@@ -65,14 +65,14 @@ func TestWorktreeInitPushCloneEditPull(t *testing.T) {
 	if k := wcKinds(st.Changes); k["hello.txt"] != worktree.Added || k["sub"] != worktree.Added || k["sub/deep.txt"] != worktree.Added || st.Remote != worktree.RemoteAbsent {
 		t.Fatalf("status after init: %+v", st)
 	}
-	pr, err := ta.Push(ctx, ca, "tester", false, 2, nil)
+	pr, err := ta.Push(ctx, ca, "tester", "", false, 2, nil)
 	if err != nil || pr.Nothing {
 		t.Fatalf("push: %v %+v", err, pr)
 	}
 	if st, _ = ta.Status(2); len(st.Changes) != 0 || st.MetaOnly != 0 || st.Remote != worktree.RemoteUpToDate {
 		t.Fatalf("status after push: %+v", st)
 	}
-	if pr, err = ta.Push(ctx, ca, "tester", false, 2, nil); err != nil || !pr.Nothing {
+	if pr, err = ta.Push(ctx, ca, "tester", "", false, 2, nil); err != nil || !pr.Nothing {
 		t.Fatalf("second push: %v %+v", err, pr)
 	}
 
@@ -102,7 +102,7 @@ func TestWorktreeInitPushCloneEditPull(t *testing.T) {
 	if k := wcKinds(st.Changes); k["hello.txt"] != worktree.Modified || k["new.txt"] != worktree.Added || k["sub/deep.txt"] != worktree.Deleted || len(st.Changes) != 3 {
 		t.Fatalf("status after edits: %+v", st)
 	}
-	if _, err := tb.Push(ctx, cb, "tester", false, 2, nil); err != nil {
+	if _, err := tb.Push(ctx, cb, "tester", "", false, 2, nil); err != nil {
 		t.Fatalf("push from B: %v", err)
 	}
 
@@ -145,7 +145,7 @@ func cloneTwo(t *testing.T, h *harness, name string) (ta, tb *worktree.Tree, ca,
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := t0.Push(ctx, c0, "tester", false, 2, nil); err != nil {
+	if _, err := t0.Push(ctx, c0, "tester", "", false, 2, nil); err != nil {
 		t.Fatal(err)
 	}
 	t0.Close()
@@ -172,11 +172,11 @@ func TestWorktreeConflict(t *testing.T) {
 	writeWC(t, ta.Root, "f.txt", "A\n")
 	writeWC(t, tb.Root, "f.txt", "B\n")
 	writeWC(t, tb.Root, "b.txt", "b\n")
-	if _, err := ta.Push(ctx, ca, "a", false, 2, nil); err != nil {
+	if _, err := ta.Push(ctx, ca, "a", "", false, 2, nil); err != nil {
 		t.Fatalf("push A: %v", err)
 	}
 	// B has not fetched: the cluster refuses its push.
-	if _, err := tb.Push(ctx, cb, "b", false, 2, nil); !errors.Is(err, worktree.ErrRefChanged) {
+	if _, err := tb.Push(ctx, cb, "b", "", false, 2, nil); !errors.Is(err, worktree.ErrRefChanged) {
 		t.Fatalf("push B: err = %v, want ErrRefChanged", err)
 	}
 	plr, err := tb.Pull(ctx, cb, false, 2, nil)
@@ -192,7 +192,7 @@ func TestWorktreeConflict(t *testing.T) {
 	if readWC(t, tb.Root, "f.txt") != "A\n" || readWC(t, tb.Root, "b.txt") != "b\n" {
 		t.Fatal("forced pull: remote side on the conflict, local addition kept")
 	}
-	if _, err := tb.Push(ctx, cb, "b", false, 2, nil); err != nil {
+	if _, err := tb.Push(ctx, cb, "b", "", false, 2, nil); err != nil {
 		t.Fatalf("push B after pull: %v", err)
 	}
 	if _, err := ta.Pull(ctx, ca, false, 2, nil); err != nil {
@@ -216,12 +216,12 @@ func TestWorktreePushRecoversAfterLostState(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tr.Close()
-	if _, err := tr.Push(ctx, c, "tester", false, 2, nil); err != nil {
+	if _, err := tr.Push(ctx, c, "tester", "", false, 2, nil); err != nil {
 		t.Fatal(err)
 	}
 	writeWC(t, dir, "f.txt", "2\n")
 	before := tr.State
-	pr, err := tr.Push(ctx, c, "tester", false, 2, nil)
+	pr, err := tr.Push(ctx, c, "tester", "", false, 2, nil)
 	if err != nil || pr.Recovered {
 		t.Fatalf("push: %v %+v", err, pr)
 	}
@@ -230,7 +230,7 @@ func TestWorktreePushRecoversAfterLostState(t *testing.T) {
 	if err := tr.SaveState(); err != nil {
 		t.Fatal(err)
 	}
-	pr, err = tr.Push(ctx, c, "tester", false, 2, nil)
+	pr, err = tr.Push(ctx, c, "tester", "", false, 2, nil)
 	if err != nil || !pr.Recovered {
 		t.Fatalf("retried push: %v %+v", err, pr)
 	}

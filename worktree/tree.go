@@ -48,17 +48,35 @@ type Config struct {
 // State is the working copy's position: base is the tree the directory was
 // last synced to; remote the reference's tree as of the last fetch, with
 // its cluster version (HasRemote false: the reference does not exist).
+// When the reference names a commit (a branch), RemoteCommit is that commit
+// and Remote its tree; otherwise RemoteCommit is the zero key.
 type State struct {
 	Base          key.Key
 	Remote        key.Key
+	RemoteCommit  key.Key
 	HasRemote     bool
 	RemoteVersion []byte
 	SyncedAt      time.Time
 }
 
+// IsBranch reports whether the fetched reference names a commit.
+func (s State) IsBranch() bool {
+	return s.HasRemote && s.RemoteCommit.Type() == key.Commit
+}
+
+// RemoteKey is the key the reference named at the last fetch: the commit
+// on a branch, else the tree.
+func (s State) RemoteKey() key.Key {
+	if s.IsBranch() {
+		return s.RemoteCommit
+	}
+	return s.Remote
+}
+
 type stateJSON struct {
 	Base          string `json:"base"`
 	Remote        string `json:"remote"`
+	RemoteCommit  string `json:"remote_commit,omitempty"`
 	RemoteVersion string `json:"remote_version"`
 	SyncedAt      string `json:"synced_at"`
 }
@@ -187,6 +205,9 @@ func (t *Tree) SaveState() error {
 	j := stateJSON{Base: s.Base.String(), SyncedAt: s.SyncedAt.UTC().Format(time.RFC3339Nano)}
 	if s.HasRemote {
 		j.Remote = s.Remote.String()
+		if s.IsBranch() {
+			j.RemoteCommit = s.RemoteCommit.String()
+		}
 		j.RemoteVersion = hex.EncodeToString(s.RemoteVersion)
 	}
 	return writeJSON(filepath.Join(t.Root, Dir, stateFile), j)
@@ -212,6 +233,14 @@ func loadState(root string) (State, error) {
 		s.HasRemote = true
 		if s.Remote, err = parseKey(j.Remote); err != nil {
 			return State{}, fmt.Errorf("bad state file: remote: %w", err)
+		}
+		if j.RemoteCommit != "" {
+			if s.RemoteCommit, err = parseKey(j.RemoteCommit); err != nil {
+				return State{}, fmt.Errorf("bad state file: remote_commit: %w", err)
+			}
+			if s.RemoteCommit.Type() != key.Commit {
+				return State{}, fmt.Errorf("bad state file: remote_commit %s is a %s", s.RemoteCommit, s.RemoteCommit.Type())
+			}
 		}
 		if s.RemoteVersion, err = hex.DecodeString(j.RemoteVersion); err != nil {
 			return State{}, fmt.Errorf("bad state file: remote_version: %w", err)

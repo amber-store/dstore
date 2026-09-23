@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/amber-store/core/key"
 	"github.com/amber-store/core/reference"
 	"github.com/amber-store/dstore/client"
 	"github.com/amber-store/dstore/ticket"
@@ -153,7 +154,7 @@ func cloneCmd() *cli.Command {
 				return err
 			}
 			defer tr.Close()
-			fmt.Printf("cloned %s into %s: root %s, %d objects fetched (%d bytes)\n", name, dir, fr.Key.String()[:16], fr.Stats.Fetched, fr.Stats.Bytes)
+			fmt.Printf("cloned %s into %s: %s, %d objects fetched (%d bytes)\n", name, dir, fetchedDesc(fr), fr.Stats.Fetched, fr.Stats.Bytes)
 			return nil
 		},
 	}
@@ -201,7 +202,7 @@ func initCmd() *cli.Command {
 			}
 			defer tr.Close()
 			if fr.Exists {
-				fmt.Printf("initialised working copy of %s; the reference exists (root %s): status shows everything as new, pull merges\n", name, fr.Key.String()[:16])
+				fmt.Printf("initialised working copy of %s; the reference exists (%s): status shows everything as new, pull merges\n", name, fetchedDesc(fr))
 			} else {
 				fmt.Printf("initialised working copy of %s; the reference does not exist yet: push creates it\n", name)
 			}
@@ -259,7 +260,7 @@ func fetchCmd() *cli.Command {
 			case fr.UpToDate:
 				fmt.Printf("%s: up to date (%s)\n", name, fr.Key.String()[:16])
 			default:
-				fmt.Printf("fetched %s: root %s, %d objects fetched (%d bytes)\n", name, fr.Key.String()[:16], fr.Stats.Fetched, fr.Stats.Bytes)
+				fmt.Printf("fetched %s: %s, %d objects fetched (%d bytes)\n", name, fetchedDesc(fr), fr.Stats.Fetched, fr.Stats.Bytes)
 			}
 			return nil
 		},
@@ -307,6 +308,7 @@ func pushCmd() *cli.Command {
 		Flags: append(wcFlags(),
 			&cli.StringFlag{Name: "user", Usage: "user identity recorded in the reference (default: the stored one, then the OS user)"},
 			&cli.BoolFlag{Name: "force", Usage: "replace the reference unconditionally"},
+			&cli.StringFlag{Name: "message", Aliases: []string{"m"}, Usage: "commit message; on a branch (a reference naming a commit) every push makes a commit, and a message makes one on any reference"},
 			jobsFlag(), noTUIFlag()),
 		Action: func(c *cli.Context) error {
 			var r worktree.PushResult
@@ -317,7 +319,7 @@ func pushCmd() *cli.Command {
 				if err != nil {
 					return err
 				}
-				r, err = tr.Push(ctx, cl, u, c.Bool("force"), c.Int("jobs"), prog)
+				r, err = tr.Push(ctx, cl, u, c.String("message"), c.Bool("force"), c.Int("jobs"), prog)
 				return err
 			})
 			if err != nil {
@@ -327,13 +329,33 @@ func pushCmd() *cli.Command {
 			case r.Nothing:
 				fmt.Println("nothing to push")
 			case r.Recovered:
-				fmt.Printf("%s already holds %s (an earlier push completed); state updated\n", name, r.Root.String()[:16])
+				fmt.Printf("%s already holds %s (an earlier push completed); state updated\n", name, pushedKey(r).String()[:16])
+			case r.Commit.Type() == key.Commit:
+				fmt.Printf("pushed %s: commit %s, root %s, %d objects, %d uploaded, version %x\n", name, r.Commit.String()[:16], r.Root.String()[:16], r.Stats.Keys, r.Stats.Uploaded, r.Stats.Version)
 			default:
 				fmt.Printf("pushed %s: root %s, %d objects, %d uploaded, version %x\n", name, r.Root.String()[:16], r.Stats.Keys, r.Stats.Uploaded, r.Stats.Version)
 			}
 			return nil
 		},
 	}
+}
+
+// fetchedDesc names what a fetch found: the tree, or the commit and its
+// tree on a branch.
+func fetchedDesc(fr worktree.FetchResult) string {
+	if fr.Key.Type() == key.Commit {
+		return fmt.Sprintf("commit %s, root %s", fr.Key.String()[:16], fr.Tree.String()[:16])
+	}
+	return "root " + fr.Key.String()[:16]
+}
+
+// pushedKey is what the reference names after a push: the commit on a
+// branch, else the tree.
+func pushedKey(r worktree.PushResult) key.Key {
+	if r.Commit.Type() == key.Commit {
+		return r.Commit
+	}
+	return r.Root
 }
 
 func statusCmd() *cli.Command {

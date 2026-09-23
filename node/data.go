@@ -269,7 +269,9 @@ func verifyRecord(raw amberpack.RawRecord) ([32]byte, []byte, error) {
 		return [32]byte{}, nil, fmt.Errorf("payload hashes to %s", want)
 	}
 	switch k.Type() {
-	case key.Blob, key.XattrSet:
+	case key.Blob, key.XattrSet, key.Commit:
+		// These carry their own serialized length; directory and file
+		// nodes carry their subtree's.
 		if k.Length() != uint64(len(payload)) {
 			return [32]byte{}, nil, errors.New("length field mismatch")
 		}

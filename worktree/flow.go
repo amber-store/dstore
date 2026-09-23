@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"slices"
 	"time"
 
+	"github.com/amber-store/core/commit"
 	"github.com/amber-store/core/ingest"
 	"github.com/amber-store/core/key"
 	"github.com/amber-store/core/packstore"
@@ -26,9 +28,10 @@ var (
 
 // FetchResult reports what a fetch found.
 type FetchResult struct {
-	Exists   bool // the reference exists on the cluster
-	UpToDate bool // its tree was already the stored remote
-	Key      key.Key
+	Exists   bool    // the reference exists on the cluster
+	UpToDate bool    // its tree was already the stored remote
+	Key      key.Key // what the reference names: a tree, or a commit on a branch
+	Tree     key.Key // the tree it stands for
 	Stats    client.PullStats
 }
 
@@ -38,7 +41,7 @@ func (t *Tree) fetch(ctx context.Context, cl *client.Cluster, prog client.Progre
 	var r FetchResult
 	ref, err := cl.RefGet(ctx, t.Config.Name)
 	if errors.Is(err, client.ErrUnknownRef) {
-		t.State.HasRemote, t.State.Remote, t.State.RemoteVersion = false, key.Key{}, nil
+		t.State.HasRemote, t.State.Remote, t.State.RemoteCommit, t.State.RemoteVersion = false, key.Key{}, key.Key{}, nil
 		return r, nil
 	}
 	if err != nil {
@@ -49,12 +52,22 @@ func (t *Tree) fetch(ctx context.Context, cl *client.Cluster, prog client.Progre
 		return r, err
 	}
 	r.Exists, r.Key = true, k
-	if t.State.HasRemote && t.State.Remote == k {
+	if t.State.HasRemote && t.State.RemoteKey() == k {
 		r.UpToDate = true
 	} else if err := cl.PullTree(ctx, t.Store, k, &r.Stats, prog); err != nil {
+		// On a branch this pulls the commit's whole history too.
 		return r, err
 	}
-	t.State.HasRemote, t.State.Remote, t.State.RemoteVersion = true, k, ref.Version
+	tree, err := client.TreeOf(k, t.Get)
+	if err != nil {
+		return r, err
+	}
+	var rc key.Key
+	if k.Type() == key.Commit {
+		rc = k
+	}
+	r.Tree = tree
+	t.State.HasRemote, t.State.Remote, t.State.RemoteCommit, t.State.RemoteVersion = true, tree, rc, ref.Version
 	return r, nil
 }
 
@@ -204,8 +217,9 @@ func (t *Tree) Pull(ctx context.Context, cl *client.Cluster, force bool, jobs in
 // PushResult reports a push.
 type PushResult struct {
 	Root      key.Key
-	Nothing   bool // the tree equals base and base is what the cluster holds
-	Recovered bool // the cluster already held this tree from an interrupted push
+	Commit    key.Key // the commit pushed on a branch; zero for a plain tree
+	Nothing   bool    // the tree equals base and base is what the cluster holds
+	Recovered bool    // the cluster already held this tree from an interrupted push
 	Built     packstore.WriteStats
 	Stats     client.PushStats
 }
@@ -214,7 +228,13 @@ type PushResult struct {
 // reference under compare-and-swap on the stored remote version. It refuses
 // when base and remote differ (a fetch showed the cluster moved) unless
 // force, which replaces the reference unconditionally.
-func (t *Tree) Push(ctx context.Context, cl *client.Cluster, user string, force bool, jobs int, prog client.Progress) (PushResult, error) {
+//
+// When the reference is a branch (it names a commit), the tree is recorded
+// as a new commit whose parent is the fetched one, with user as author and
+// committer and message as its message, and the reference moves to that
+// commit. A non-empty message makes a commit on a plain or new reference
+// too, turning it into a branch.
+func (t *Tree) Push(ctx context.Context, cl *client.Cluster, user, message string, force bool, jobs int, prog client.Progress) (PushResult, error) {
 	var r PushResult
 	empty, _ := EmptyTree()
 	synced := (t.State.HasRemote && t.State.Remote == t.State.Base) || (!t.State.HasRemote && t.State.Base == empty)
@@ -233,29 +253,82 @@ func (t *Tree) Push(ctx context.Context, cl *client.Cluster, user string, force 
 		r.Nothing = true
 		return r, nil
 	}
+	target := root
+	var parents []key.Key
+	if t.State.IsBranch() || message != "" {
+		if t.State.IsBranch() {
+			parents = []key.Key{t.State.RemoteCommit}
+		}
+		if target, err = t.commit(root, parents, user, message); err != nil {
+			return r, err
+		}
+		r.Commit = target
+	}
 	cond := client.Cond{Force: force}
 	if !force {
 		cond.Versioned = true
 		cond.ExpectedVersion = t.State.RemoteVersion // nil: the name must be new
 	}
-	ps, err := cl.Push(ctx, t.Store, root, t.Config.Name, user, cond, prog)
+	ps, err := cl.Push(ctx, t.Store, target, t.Config.Name, user, cond, prog)
 	if err != nil {
 		var cm *client.CASMismatch
 		if !errors.As(err, &cm) {
 			return r, err
 		}
 		cur, perr := key.Parse(cm.Current)
-		if !cm.HasCurrent || perr != nil || cur != root {
+		if !cm.HasCurrent || perr != nil || !t.samePush(cur, target, root, parents) {
 			return r, fmt.Errorf("%w (%v)", ErrRefChanged, err)
 		}
 		r.Recovered = true
 		t.State.RemoteVersion = cm.Version
+		if target.Type() == key.Commit {
+			target, r.Commit = cur, cur
+		}
 	} else {
 		r.Stats = ps
 		t.State.RemoteVersion = ps.Version
 	}
-	t.State.Base, t.State.Remote, t.State.HasRemote, t.State.SyncedAt = root, root, true, time.Now()
+	var rc key.Key
+	if target.Type() == key.Commit {
+		rc = target
+	}
+	t.State.Base, t.State.Remote, t.State.RemoteCommit, t.State.HasRemote, t.State.SyncedAt = root, root, rc, true, time.Now()
 	return r, t.SaveState()
+}
+
+// commit records tree as a commit with the given parents in the local store
+// and returns its key.
+func (t *Tree) commit(tree key.Key, parents []key.Key, user, message string) (key.Key, error) {
+	now := time.Now()
+	_, off := now.Zone()
+	id := commit.Identity{Name: user, When: now.UnixNano(), TZOffset: off / 60}
+	k, raw, err := commit.Commit{Tree: tree, Parents: parents, Author: id, Committer: id, Message: message}.Object()
+	if err != nil {
+		return key.Key{}, fmt.Errorf("commit: %w", err)
+	}
+	if err := t.Store.Put(k, raw); err != nil {
+		return key.Key{}, err
+	}
+	return k, nil
+}
+
+// samePush reports whether the cluster's current key cur is what this push
+// would have written: the same key, or, on a branch, a commit made by an
+// interrupted earlier push of the same tree onto the same parents (its
+// timestamp, and so its key, differ from this attempt's).
+func (t *Tree) samePush(cur, target, tree key.Key, parents []key.Key) bool {
+	if cur == target {
+		return true
+	}
+	if cur.Type() != key.Commit || target.Type() != key.Commit {
+		return false
+	}
+	data, err := t.Get(cur) // an earlier attempt stored its commit locally
+	if err != nil {
+		return false
+	}
+	c, err := commit.Decode(data)
+	return err == nil && c.Tree == tree && slices.Equal(c.Parents, parents)
 }
 
 // RemoteState is how the fetched tree relates to base.

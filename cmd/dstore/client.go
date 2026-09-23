@@ -490,6 +490,9 @@ func lsCmd() *cli.Command {
 				return err
 			}
 			get := clusterGet(ctx, cl)
+			if root, err = client.TreeOf(root, get); err != nil {
+				return err
+			}
 			dir := root
 			if p := c.Args().Get(1); p != "" && p != "/" {
 				dir, err = fstree.ResolvePath(root, strings.Trim(p, "/"), get)
@@ -535,6 +538,9 @@ func catCmd() *cli.Command {
 				return err
 			}
 			get := clusterGet(ctx, cl)
+			if root, err = client.TreeOf(root, get); err != nil {
+				return err
+			}
 			e, err := fstree.ResolveEntry(root, strings.Trim(c.Args().Get(1), "/"), get)
 			if err != nil {
 				return err
