@@ -157,8 +157,10 @@ footprint, its own bytes plus the length field of every tree it records.
 Commits made by dstore v0.1.10 (core v0.0.9) are keyed by their own length
 alone. Nodes refuse to store them, clients refuse to read through them, and
 while a reference names one a GC epoch aborts with its objects reported
-missing and nothing swept. Delete such a reference with `dstore ref delete`
-and push the tree again; history recorded by v0.1.10 does not carry over.
+missing and nothing swept. Delete such a reference with `dstore ref
+delete`; in a working copy of it, `dstore fetch` and then `dstore push
+--force -m MESSAGE` start the branch again from the working directory.
+History recorded by v0.1.10 does not carry over.
 
 ## Tests
 
