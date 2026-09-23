@@ -156,6 +156,9 @@ func (n *Node) handleRefPut(ctx context.Context, s transport.Stream, m *wire.Msg
 		if errors.Is(err, context.DeadlineExceeded) {
 			return wire.WriteErr(s, wire.CodeTimeout, "completeness walk exceeded put_ttl")
 		}
+		if errors.Is(err, errMalformed) {
+			return wire.WriteErr(s, wire.CodeBadRequest, err.Error())
+		}
 		return wire.WriteErr(s, wire.CodeUnavailable, "completeness walk: "+err.Error())
 	}
 	if len(missing) > 0 {
@@ -173,6 +176,13 @@ func (n *Node) handleRefPut(ctx context.Context, s transport.Stream, m *wire.Msg
 	n.log.Info("reference written", "name", name, "took", time.Since(start))
 	return wire.WriteMsg(s, n.stampReply(&wire.Msg{Type: wire.TOK, Key: rec.Key, Version: version}))
 }
+
+// errMalformed marks a completeness walk that fetched an object and could not
+// read it as a tree, a file index or a commit. Nothing under it can be
+// checked, so the reference is refused rather than accepted unverified. In
+// practice this is a commit keyed by core v0.0.9's rule, which ChildKeys
+// refuses since core v0.0.10.
+var errMalformed = errors.New("malformed object under the reference")
 
 // walkComplete walks the tree under root top-down, fetching tree objects
 // and has-and-pinning every reachable key at its owners. It returns the
@@ -227,9 +237,10 @@ func (n *Node) walkComplete(ctx context.Context, root [32]byte) (missing [][32]b
 		}
 		// Fetch interior objects in parallel and expand.
 		type res struct {
-			k    [32]byte
-			kids []key.Key
-			err  error
+			k         [32]byte
+			kids      []key.Key
+			err       error
+			malformed bool // fetched, but ChildKeys refused it
 		}
 		results := make([]res, len(interior))
 		var wg sync.WaitGroup
@@ -246,11 +257,16 @@ func (n *Node) walkComplete(ctx context.Context, root [32]byte) (missing [][32]b
 					return
 				}
 				kids, err := fstree.ChildKeys(key.Key(k), data)
-				results[i] = res{k: k, kids: kids, err: err}
+				results[i] = res{k: k, kids: kids, err: err, malformed: err != nil}
 			}(i, k)
 		}
 		wg.Wait()
 		for _, r := range results {
+			if r.malformed {
+				// Present, so the negotiation would pass it, with everything
+				// below it unchecked.
+				return nil, 0, fmt.Errorf("%w: %v", errMalformed, r.err)
+			}
 			if r.err != nil {
 				// Absent everywhere: incomplete; the negotiation reports it.
 				continue

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/amber-store/core/fstree"
@@ -81,13 +82,46 @@ type stateJSON struct {
 	SyncedAt      string `json:"synced_at"`
 }
 
-// Tree is an open working copy. Store is its packstore; its lock makes the
-// working copy single-user.
+// Tree is an open working copy. Store is its packstore. One command at a
+// time has a working copy open: lock is held from Open or Create to Close.
 type Tree struct {
 	Root   string
 	Config Config
 	State  State
 	Store  *packstore.Store
+	lock   *os.File
+}
+
+// ErrInUse is returned, wrapped, by Open and Create while another dstore
+// command has the working copy open.
+var ErrInUse = errors.New("in use by another dstore command")
+
+// lockFile is the working copy's lock, an exclusive flock(2) taken without
+// waiting. Until core v0.0.10 the packstore's single-owner lock did this job
+// on the side; a packstore may now be open in any number of processes, and
+// two commands at once would race on the state file and on the working
+// directory itself.
+const lockFile = "lock"
+
+func lockWorkingCopy(root string) (*os.File, error) {
+	f, err := os.OpenFile(filepath.Join(root, Dir, lockFile), os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err != syscall.EINTR {
+			break
+		}
+	}
+	if err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("working copy %s: %w", root, ErrInUse)
+		}
+		return nil, fmt.Errorf("working copy %s: %w", root, err)
+	}
+	return f, nil
 }
 
 // EmptyTree returns the empty directory object: its key and bytes.
@@ -148,12 +182,17 @@ func openRaw(dir string) (*Tree, error) {
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return nil, fmt.Errorf("working copy %s: bad config: %w", root, err)
 	}
-	store, err := packstore.Open(filepath.Join(root, Dir, storeDir), packstore.WithSync(true))
+	lock, err := lockWorkingCopy(root)
 	if err != nil {
 		return nil, err
 	}
+	store, err := packstore.Open(filepath.Join(root, Dir, storeDir), packstore.WithSync(true))
+	if err != nil {
+		lock.Close()
+		return nil, err
+	}
 	empty, _ := EmptyTree()
-	return &Tree{Root: root, Config: cfg, State: State{Base: empty}, Store: store}, nil
+	return &Tree{Root: root, Config: cfg, State: State{Base: empty}, Store: store, lock: lock}, nil
 }
 
 // Create makes a fresh .dstore in dir (which must not already be a working
@@ -171,19 +210,26 @@ func Create(dir string, cfg Config) (*Tree, error) {
 	if err := os.MkdirAll(meta, 0o755); err != nil {
 		return nil, err
 	}
+	lock, err := lockWorkingCopy(abs)
+	if err != nil {
+		return nil, err
+	}
 	if err := writeJSON(filepath.Join(meta, configFile), cfg); err != nil {
+		lock.Close()
 		return nil, err
 	}
 	store, err := packstore.Open(filepath.Join(meta, storeDir), packstore.WithSync(true))
 	if err != nil {
+		lock.Close()
 		return nil, err
 	}
 	empty, bytes := EmptyTree()
 	if err := store.Put(empty, bytes); err != nil {
 		store.Close()
+		lock.Close()
 		return nil, err
 	}
-	return &Tree{Root: abs, Config: cfg, State: State{Base: empty, SyncedAt: time.Now()}, Store: store}, nil
+	return &Tree{Root: abs, Config: cfg, State: State{Base: empty, SyncedAt: time.Now()}, Store: store, lock: lock}, nil
 }
 
 // Remove deletes dir's .dstore (a failed clone or init).
@@ -191,7 +237,14 @@ func Remove(dir string) error {
 	return os.RemoveAll(filepath.Join(dir, Dir))
 }
 
-func (t *Tree) Close() error { return t.Store.Close() }
+// Close closes the store and then lets go of the working copy.
+func (t *Tree) Close() error {
+	err := t.Store.Close()
+	if t.lock != nil {
+		t.lock.Close() // releases the flock
+	}
+	return err
+}
 
 // Get reads an object's payload from the local packstore.
 func (t *Tree) Get(k key.Key) ([]byte, error) { return t.Store.Get(k) }

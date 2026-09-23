@@ -206,18 +206,21 @@ func Open(cfg Config) (*Node, error) {
 	n := &Node{cfg: cfg, log: cfg.Logger, ep: cfg.Endpoint, id: cfg.Endpoint.ID(),
 		unreachable: map[view.NodeID]time.Time{}, completeCache: map[[32]byte]time.Time{}, recent: map[[32]byte]time.Time{}, joinAddrs: map[view.NodeID][]string{}}
 	n.log = n.log.With("node", view.ShortID(n.id))
-	st, err := packstore.Open(filepath.Join(cfg.StoreDir, "packstore"),
-		packstore.WithSync(!cfg.NoSync), packstore.WithSegmentSize(cfg.SegmentSize))
-	if err != nil {
-		return nil, err
-	}
-	n.store = st
+	// meta first: its lock is what keeps a second node off the directory.
+	// Since core v0.0.10 any number of processes may open one packstore, so
+	// a second node must be refused before it touches the running one's.
 	md, err := meta.Open(filepath.Join(cfg.StoreDir, "meta"))
 	if err != nil {
-		st.Close()
 		return nil, err
 	}
 	n.meta = md
+	st, err := packstore.Open(filepath.Join(cfg.StoreDir, "packstore"),
+		packstore.WithSync(!cfg.NoSync), packstore.WithSegmentSize(cfg.SegmentSize))
+	if err != nil {
+		md.Close()
+		return nil, err
+	}
+	n.store = st
 	sid, err := md.Get([]byte(mkStoreID))
 	if err != nil {
 		sid = make([]byte, 16)

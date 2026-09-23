@@ -1183,7 +1183,21 @@ func (g *gcState) runCycle(ctx context.Context, tolerate, manual bool) error {
 			}
 			_, _ = n.cat.CASGC(ctx, func(st *catalog.GCState) error { st.Missing = raw; return nil })
 			g.abort(ctx, epoch, fmt.Sprintf("%d objects missing under references", len(missing)))
-			return fmt.Errorf("gc: %d objects missing under references; nothing swept", len(missing))
+			// Name a few: a missing key that is a reference's own key (what
+			// a commit of the older key rule looks like) can be found with
+			// `dstore refs`.
+			sample := ""
+			for i, k := range missing {
+				if i == 3 {
+					sample += ", ..."
+					break
+				}
+				if i > 0 {
+					sample += ", "
+				}
+				sample += fmt.Sprintf("%x", k[:])
+			}
+			return fmt.Errorf("gc: %d objects missing under references; nothing swept (missing: %s)", len(missing), sample)
 		}
 	}
 	// Freeze the workers and move to sweep.

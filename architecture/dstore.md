@@ -1464,8 +1464,12 @@ length field as the commit's footprint — its own serialized length plus the
 length field of every tree it records, the conflict terms included (core
 v0.0.10) — from the record alone: the trees' keys are in the payload. A
 commit keyed by core v0.0.9's rule, its own length, is refused by `put`, by
-the client and by `ChildKeys`; under a reference it counts as missing, so a
-GC epoch aborts with nothing swept until the reference is moved or deleted.
+the client and by `ChildKeys`. A `ref-put` whose completeness walk fetches
+an object that `ChildKeys` cannot read is refused with `bad-request`, not
+treated as incomplete: present at its owners, it would otherwise pass the
+negotiation with nothing below it checked. Under an existing reference such
+a commit counts as missing, so a GC epoch aborts, naming the keys, with
+nothing swept until the reference is moved or deleted.
 
 Batches (`gc-keys {g, nonce, seq, keys[], expand: bool}`, ≤ 8192 keys,
 flushed every 50 ms) are accepted only from acked nodes at epoch `g`;
