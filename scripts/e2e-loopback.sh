@@ -39,11 +39,11 @@ grep -q 'nodes 3 voters 3' status.out || { echo "cluster did not reach 3 nodes /
 TAB=$(printf '\t')
 $B watch --no-relay 'trees/**' > watch.out 2> watch.err &
 sleep 2
-$B push --local local1 --user e2e --no-relay src trees/demo
+$B store push --local local1 --user e2e --no-relay src trees/demo
 $B refs --no-relay
 $B ls --no-relay trees/demo sub | grep -q g.bin
 [ "$($B cat --no-relay trees/demo hello.txt)" = "hello dstore" ]
-$B pull --local local2 --no-relay trees/demo
+$B store pull --local local2 --no-relay trees/demo
 # Ids alone reach the cluster: the nodes announce over mDNS.
 IDS=$($B cluster ticket --no-relay --ids)
 echo "node ids: $IDS"

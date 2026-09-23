@@ -142,7 +142,9 @@ and refuses on a path changed on both sides unless `--force`. Paths that
 `.amberignore` hides are invisible to `status` and never pushed. A
 `touch` shows up only in a count of metadata-only differences, but is
 recorded by the next push. `.dstore/packstore` grows with every fetch and
-push; there is no local compaction yet.
+push; there is no local compaction yet. One command at a time runs in a
+working copy: `.dstore/lock` is held while one runs, and a second fails
+with `in use by another dstore command`.
 
 A reference that names a commit (core object type 5, made by
 `amber-store commit create` or by `push -m`) is a branch. Clone, fetch and
@@ -151,6 +153,25 @@ branch records a new commit with the fetched one as parent, the user as
 author and `-m` as the message, so the cluster keeps the whole history
 alive. A message on a plain reference turns it into a branch. `ls` and
 `cat` accept a branch too.
+
+A directory entry may hold a commit (core v0.0.10) and reads as the
+commit's tree. A working copy shows it as a plain directory, and a push
+writes it back as one, without the commit.
+
+Commit keys follow core v0.0.10: the length field is the commit's
+footprint, its own bytes plus the length field of every tree it records.
+Commits made by dstore v0.1.10 (core v0.0.9) are keyed by their own length
+alone, and this release refuses them: nodes neither store them nor accept a
+reference on them, clients do not read through them, and while a reference
+names one a GC epoch aborts, naming the missing keys, with nothing swept.
+**Before upgrading** a cluster that holds such branches, clone each into a
+working copy; afterwards nothing reads them. Upgrade every node and every
+client before pushing to a branch again: a v0.1.10 node refuses the new
+commits as a v0.1.11 node refuses the old. Then start each branch again:
+`dstore ref delete NAME`, and in its working copy `dstore fetch` followed
+by `dstore push --force -m MESSAGE`. History recorded by v0.1.10 does not
+carry over, and a reference deleted without a working copy leaves its tree
+to the next GC.
 
 ## Tests
 

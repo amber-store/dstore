@@ -13,7 +13,8 @@ import (
 
 // Get batch limits: a batch is at most getBatchKeys keys or getBatchBytes
 // by the keys' length fields, a blob's length being its record size and
-// a tree object's capped at a chunk.
+// a tree object's — or a commit's, which is its footprint — capped at a
+// chunk.
 const (
 	getBatchKeys  = 2048
 	getBatchBytes = 8 << 20

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/amber-store/core/amberpack"
+	"github.com/amber-store/core/commit"
 	"github.com/amber-store/core/key"
 	"github.com/amber-store/core/packstore"
 	"github.com/amber-store/dstore/transport"
@@ -269,11 +270,28 @@ func verifyRecord(raw amberpack.RawRecord) ([32]byte, []byte, error) {
 		return [32]byte{}, nil, fmt.Errorf("payload hashes to %s", want)
 	}
 	switch k.Type() {
-	case key.Blob, key.XattrSet, key.Commit:
+	case key.Blob, key.XattrSet:
 		// These carry their own serialized length; directory and file
 		// nodes carry their subtree's.
 		if k.Length() != uint64(len(payload)) {
 			return [32]byte{}, nil, errors.New("length field mismatch")
+		}
+	case key.Commit:
+		// A commit carries its footprint: its own bytes plus the length
+		// field of every tree it records (core v0.0.10). The trees' keys are
+		// in the payload, so a node holds the key to the rule without having
+		// the trees. A commit keyed by core v0.0.9's rule, its own bytes
+		// alone, is refused here, as core's walks and scrubs refuse it.
+		c, err := commit.Decode(payload)
+		if err != nil {
+			return [32]byte{}, nil, fmt.Errorf("commit: %w", err)
+		}
+		want, err := commit.Footprint(uint64(len(payload)), c.Trees())
+		if err != nil {
+			return [32]byte{}, nil, fmt.Errorf("commit: %w", err)
+		}
+		if k.Length() != want {
+			return [32]byte{}, nil, fmt.Errorf("length field %d is not the commit's footprint %d; a commit keyed by an older rule has to be created again", k.Length(), want)
 		}
 	}
 	return [32]byte(k), append([]byte{}, raw.Bytes...), nil
@@ -558,11 +576,15 @@ func (n *Node) fetchRecord(ctx context.Context, k [32]byte) ([]byte, error) {
 		return rec, nil
 	}
 	pl := n.Placement()
+	var refused error
 	for _, o := range pl.ReadOrder(k) {
 		if o == n.id {
 			continue
 		}
-		recs, err := n.getFrom(ctx, o, [][32]byte{k})
+		recs, bad, err := n.getFromChecked(ctx, o, [][32]byte{k})
+		if e, ok := bad[k]; ok {
+			refused = e
+		}
 		if err != nil {
 			continue
 		}
@@ -570,42 +592,66 @@ func (n *Node) fetchRecord(ctx context.Context, k [32]byte) ([]byte, error) {
 			return rec, nil
 		}
 	}
+	if refused != nil {
+		return nil, &refusedError{err: refused}
+	}
 	return nil, packstore.ErrNotFound
 }
 
-// getFrom fetches records from one peer.
+// refusedError is fetchRecord's answer when a peer sent a record under the
+// key and verifyRecord refused it: in practice a commit keyed by core
+// v0.0.9's rule, which its owners still hold from before an upgrade. For a
+// caller that only asks whether the object can be had it is not found; the
+// completeness walk of a ref-put must tell it from absent, because the
+// owners report such a key as present.
+type refusedError struct{ err error }
+
+func (e *refusedError) Error() string   { return "record refused: " + e.err.Error() }
+func (e *refusedError) Unwrap() []error { return []error{packstore.ErrNotFound, e.err} }
+
+// getFrom fetches records from one peer. Records that verifyRecord refuses
+// are left out.
 func (n *Node) getFrom(ctx context.Context, to view.NodeID, keys [][32]byte) (map[[32]byte][]byte, error) {
+	out, _, err := n.getFromChecked(ctx, to, keys)
+	return out, err
+}
+
+// getFromChecked is getFrom that also says which records it left out, and
+// why.
+func (n *Node) getFromChecked(ctx context.Context, to view.NodeID, keys [][32]byte) (map[[32]byte][]byte, map[[32]byte]error, error) {
 	cctx, cancel := context.WithTimeout(ctx, n.cfg.ForwardTimeout)
 	defer cancel()
 	s, err := n.pool.Open(cctx, to, wire.ALPNCluster)
 	if err != nil {
 		n.markUnreachable(to, err)
-		return nil, err
+		return nil, nil, err
 	}
 	defer wire.CloseStream(s)
 	if err := wire.WriteMsg(s, n.stampReq(&wire.Msg{Type: wire.TGet, Keys: wire.RawKeys(keys)})); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	_ = s.CloseWrite()
 	if _, err := wire.Expect(s, wire.TAbsent); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	out := map[[32]byte][]byte{}
+	bad := map[[32]byte]error{}
 	pr := wire.NewPackReader(s)
 	reader := amberpack.NewReader(pr)
 	for raw, err := range reader.Records() {
 		if err != nil {
-			return out, err
+			return out, bad, err
 		}
 		k, rec, err := verifyRecord(raw)
 		if err != nil {
+			bad[[32]byte(raw.Key)] = err
 			continue
 		}
 		out[k] = rec
 	}
 	_, _ = io.Copy(io.Discard, pr)
 	n.markReachable(to)
-	return out, nil
+	return out, bad, nil
 }
 
 // getData returns an object's decoded payload from anywhere in the cluster.
