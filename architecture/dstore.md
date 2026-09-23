@@ -1465,9 +1465,12 @@ length field of every tree it records, the conflict terms included (core
 v0.0.10) — from the record alone: the trees' keys are in the payload. A
 commit keyed by core v0.0.9's rule, its own length, is refused by `put`, by
 the client and by `ChildKeys`. A `ref-put` whose completeness walk fetches
-an object that `ChildKeys` cannot read is refused with `bad-request`, not
-treated as incomplete: present at its owners, it would otherwise pass the
-negotiation with nothing below it checked. Under an existing reference such
+an object that `ChildKeys` cannot read, or is sent one by a peer that
+`verifyRecord` refuses, is refused with `bad-request`, not treated as
+incomplete: present at its owners, it would otherwise pass the negotiation
+with nothing below it checked. For the same reason an interior object that
+the walk could not fetch at all, while its owners report it present, fails
+the put with `unavailable`. Under an existing reference such
 a commit counts as missing, so a GC epoch aborts, naming the keys, with
 nothing swept until the reference is moved or deleted.
 
@@ -2011,8 +2014,10 @@ node.
 ### 11.7 Working copies
 
 A *working copy* is a directory holding one reference's tree with a
-`.dstore/` beside it: a packstore (every tree fetched or pushed, and the
-copy's lock), a config (ticket, name, connection flags, user) and a
+`.dstore/` beside it: a packstore (every tree fetched or pushed), a lock
+file that lets one command at a time in (until core v0.0.10 the packstore's
+single-owner lock did that), a config (ticket, name, connection flags, user)
+and a
 state file (*base*, the tree the directory was last synced to; *remote*,
 the tree last fetched with its version). `clone` fetches a reference's
 tree and writes it out; `init` starts from the empty tree in an existing

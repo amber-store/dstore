@@ -265,11 +265,13 @@ func (n *Node) closeStores() {
 	if n.acceptor != nil {
 		n.acceptor.Close()
 	}
-	if n.meta != nil {
-		n.meta.Close()
-	}
+	// The reverse of Open: meta's lock keeps a second node off the directory
+	// for as long as anything of this one is still open.
 	if n.store != nil {
 		n.store.Close()
+	}
+	if n.meta != nil {
+		n.meta.Close()
 	}
 }
 

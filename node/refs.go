@@ -184,6 +184,12 @@ func (n *Node) handleRefPut(ctx context.Context, s transport.Stream, m *wire.Msg
 // refuses since core v0.0.10.
 var errMalformed = errors.New("malformed object under the reference")
 
+// errUnread marks a completeness walk that could not fetch an interior object
+// which its owners nevertheless hold. The negotiation alone would pass it,
+// with everything below it unchecked; the put fails instead, and may be
+// tried again.
+var errUnread = errors.New("object held by its owners could not be read")
+
 // walkComplete walks the tree under root top-down, fetching tree objects
 // and has-and-pinning every reachable key at its owners. It returns the
 // keys held by fewer than min_replicas owners (a sample) and the total.
@@ -196,6 +202,7 @@ func (n *Node) walkComplete(ctx context.Context, root [32]byte) (missing [][32]b
 	seen := map[[32]byte]struct{}{}
 	pending := map[[32]byte]struct{}{} // keys awaiting negotiation
 	var toCheck [][32]byte
+	unread := map[[32]byte]error{} // interior keys the walk could not fetch
 	cutoff := time.Now().Add(-n.cfg.PutTTL / 2)
 
 	flush := func() error {
@@ -206,11 +213,20 @@ func (n *Node) walkComplete(ctx context.Context, root [32]byte) (missing [][32]b
 		if err != nil {
 			return err
 		}
+		isShort := make(map[[32]byte]struct{}, len(short))
 		for _, k := range short {
+			isShort[k] = struct{}{}
 			if len(missing) < 1024 {
 				missing = append(missing, k)
 			}
 			shortfall++
+		}
+		for _, k := range toCheck {
+			if uerr, ok := unread[k]; ok {
+				if _, short := isShort[k]; !short {
+					return fmt.Errorf("%w: %x: %v", errUnread, k[:8], uerr)
+				}
+			}
 		}
 		toCheck = toCheck[:0]
 		return nil
@@ -253,7 +269,10 @@ func (n *Node) walkComplete(ctx context.Context, root [32]byte) (missing [][32]b
 				defer func() { <-sem }()
 				data, err := n.getData(ctx, k)
 				if err != nil {
-					results[i] = res{k: k, err: err}
+					// A record that peers hold and verifyRecord refuses is
+					// as unreadable as one ChildKeys refuses.
+					var refused *refusedError
+					results[i] = res{k: k, err: err, malformed: errors.As(err, &refused)}
 					return
 				}
 				kids, err := fstree.ChildKeys(key.Key(k), data)
@@ -268,7 +287,9 @@ func (n *Node) walkComplete(ctx context.Context, root [32]byte) (missing [][32]b
 				return nil, 0, fmt.Errorf("%w: %v", errMalformed, r.err)
 			}
 			if r.err != nil {
-				// Absent everywhere: incomplete; the negotiation reports it.
+				// Absent everywhere: incomplete, and the negotiation reports
+				// it. Held after all: flush fails the walk.
+				unread[r.k] = r.err
 				continue
 			}
 			for _, c := range r.kids {

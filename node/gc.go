@@ -1186,16 +1186,20 @@ func (g *gcState) runCycle(ctx context.Context, tolerate, manual bool) error {
 			// Name a few: a missing key that is a reference's own key (what
 			// a commit of the older key rule looks like) can be found with
 			// `dstore refs`.
-			sample := ""
-			for i, k := range missing {
-				if i == 3 {
+			sample, named := "", 0
+			for _, k := range missing {
+				if k == ([32]byte{}) {
+					continue // a refused batch, not an object
+				}
+				if named == 3 {
 					sample += ", ..."
 					break
 				}
-				if i > 0 {
+				if named > 0 {
 					sample += ", "
 				}
 				sample += fmt.Sprintf("%x", k[:])
+				named++
 			}
 			return fmt.Errorf("gc: %d objects missing under references; nothing swept (missing: %s)", len(missing), sample)
 		}

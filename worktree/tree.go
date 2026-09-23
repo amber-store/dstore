@@ -106,7 +106,7 @@ const lockFile = "lock"
 func lockWorkingCopy(root string) (*os.File, error) {
 	f, err := os.OpenFile(filepath.Join(root, Dir, lockFile), os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("working copy %s: %w", root, err)
 	}
 	for {
 		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
@@ -174,17 +174,21 @@ func openRaw(dir string) (*Tree, error) {
 	if err != nil {
 		return nil, err
 	}
-	var cfg Config
-	b, err := os.ReadFile(filepath.Join(root, Dir, configFile))
-	if err != nil {
-		return nil, fmt.Errorf("working copy %s: %w", root, err)
-	}
-	if err := json.Unmarshal(b, &cfg); err != nil {
-		return nil, fmt.Errorf("working copy %s: bad config: %w", root, err)
-	}
+	// The lock first: the config may be rewritten by the command that holds
+	// the working copy.
 	lock, err := lockWorkingCopy(root)
 	if err != nil {
 		return nil, err
+	}
+	var cfg Config
+	b, err := os.ReadFile(filepath.Join(root, Dir, configFile))
+	if err != nil {
+		lock.Close()
+		return nil, fmt.Errorf("working copy %s: %w", root, err)
+	}
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		lock.Close()
+		return nil, fmt.Errorf("working copy %s: bad config: %w", root, err)
 	}
 	store, err := packstore.Open(filepath.Join(root, Dir, storeDir), packstore.WithSync(true))
 	if err != nil {

@@ -10,6 +10,7 @@ import (
 	"github.com/amber-store/core/fstree"
 	"github.com/amber-store/core/key"
 	"github.com/amber-store/core/reference"
+	"github.com/amber-store/dstore/catalog"
 	"github.com/amber-store/dstore/client"
 	"github.com/amber-store/dstore/wire"
 )
@@ -74,5 +75,60 @@ func TestRefPutRefusesACommitOfTheOlderKeyRule(t *testing.T) {
 	// bad-request, not unavailable: a client must not retry this.
 	if !wire.IsCode(err, wire.CodeBadRequest) {
 		t.Fatalf("the refusal is not a bad-request: %v", err)
+	}
+}
+
+// The same when the node that coordinates the put does not hold the commit,
+// the normal case in a cluster with more nodes than replicas. It fetches the
+// record from a peer, verifyRecord refuses it, and the refusal must not be
+// taken for "absent": the owners answer that they hold the key.
+func TestRefPutRefusesACommitTheCoordinatorDoesNotHold(t *testing.T) {
+	h := cluster3(t) // replicas 3, min_replicas 2
+	defer h.close()
+	ctx := context.Background()
+
+	blob, err := fstree.EncodeBlob([]byte("never uploaded"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := fstree.EncodeDirLeaf([]fstree.Entry{{Name: []byte("f"), Mode: 0o100644, ContentKey: blob.Key[:]}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := commit.Identity{Name: "alice", When: 1}
+	good, raw, err := commit.Commit{Tree: dir.Key, Author: id, Committer: id, Message: "its tree is on no node"}.Object()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := key.New(key.Commit, uint64(len(raw)), raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// On two nodes, which satisfies min_replicas; the third coordinates.
+	for _, n := range h.nodes[1:] {
+		for _, k := range []key.Key{good, old} {
+			if err := n.Store().Put(k, raw); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	coord := h.nodes[0]
+	put := func(name string, k key.Key) error {
+		rec, err := reference.Reference{Name: name, Key: k[:], User: "alice", CreatedAt: time.Now().UnixNano()}.Encode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = coord.RefPutLocal(ctx, name, rec, catalog.Cond{Force: true})
+		return err
+	}
+	if err := put("trees/control", good); err == nil || !strings.Contains(err.Error(), "incomplete") {
+		t.Fatalf("a commit whose tree is absent: %v, want incomplete", err)
+	}
+	err = put("trees/oldrule", old)
+	if err == nil {
+		t.Fatal("a reference was accepted on a commit of the older rule that the coordinator does not hold")
+	}
+	if !strings.Contains(err.Error(), "malformed object under the reference") || !strings.Contains(err.Error(), "created again") {
+		t.Fatalf("the refusal does not say why: %v", err)
 	}
 }

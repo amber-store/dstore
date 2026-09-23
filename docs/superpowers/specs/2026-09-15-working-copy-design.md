@@ -19,7 +19,7 @@ A working copy is a directory whose `.dstore/` holds:
 
 | file | what it is |
 |---|---|
-| `packstore/` | a core packstore, the local content-addressed store. Every tree fetched or pushed lands here, deduplicated. Its single-owner lock is the working copy's lock: two commands cannot run on one working copy at once. (Since core v0.0.10 a packstore has no single-owner lock; `.dstore/lock`, held from open to close, is the working copy's lock: `worktree.ErrInUse`.) |
+| `packstore/` | a core packstore, the local content-addressed store. Every tree fetched or pushed lands here, deduplicated. Two commands cannot run on one working copy at once: until core v0.0.10 the packstore's single-owner lock saw to that, and since then `.dstore/lock` does, held from open to close (`worktree.ErrInUse`). |
 | `config` | JSON: `ticket` (the full `dstore1…` form), `name` (the reference), `relay`, `no_relay`, `no_discovery`, `user`. Written by clone and init; read by every later command. |
 | `state` | JSON, written to a temporary file and renamed: `base`, `remote`, `remote_version`, `synced_at`. |
 
