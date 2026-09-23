@@ -11,6 +11,7 @@ import (
 	"github.com/amber-store/core/key"
 	"github.com/amber-store/core/reference"
 	"github.com/amber-store/dstore/client"
+	"github.com/amber-store/dstore/wire"
 )
 
 // A node that upgraded from v0.1.10 may hold commits keyed by core v0.0.9's
@@ -69,5 +70,9 @@ func TestRefPutRefusesACommitOfTheOlderKeyRule(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "malformed object under the reference") || !strings.Contains(err.Error(), "created again") {
 		t.Fatalf("the refusal does not say why: %v", err)
+	}
+	// bad-request, not unavailable: a client must not retry this.
+	if !wire.IsCode(err, wire.CodeBadRequest) {
+		t.Fatalf("the refusal is not a bad-request: %v", err)
 	}
 }
