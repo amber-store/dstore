@@ -152,6 +152,14 @@ author and `-m` as the message, so the cluster keeps the whole history
 alive. A message on a plain reference turns it into a branch. `ls` and
 `cat` accept a branch too.
 
+Commit keys follow core v0.0.10: the length field is the commit's
+footprint, its own bytes plus the length field of every tree it records.
+Commits made by dstore v0.1.10 (core v0.0.9) are keyed by their own length
+alone. Nodes refuse to store them, clients refuse to read through them, and
+while a reference names one a GC epoch aborts with its objects reported
+missing and nothing swept. Delete such a reference with `dstore ref delete`
+and push the tree again; history recorded by v0.1.10 does not carry over.
+
 ## Tests
 
 ```

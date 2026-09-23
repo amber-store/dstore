@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/amber-store/core/amberpack"
+	"github.com/amber-store/core/commit"
 	"github.com/amber-store/core/key"
 	"github.com/amber-store/core/packstore"
 	"github.com/amber-store/dstore/transport"
@@ -269,11 +270,28 @@ func verifyRecord(raw amberpack.RawRecord) ([32]byte, []byte, error) {
 		return [32]byte{}, nil, fmt.Errorf("payload hashes to %s", want)
 	}
 	switch k.Type() {
-	case key.Blob, key.XattrSet, key.Commit:
+	case key.Blob, key.XattrSet:
 		// These carry their own serialized length; directory and file
 		// nodes carry their subtree's.
 		if k.Length() != uint64(len(payload)) {
 			return [32]byte{}, nil, errors.New("length field mismatch")
+		}
+	case key.Commit:
+		// A commit carries its footprint: its own bytes plus the length
+		// field of every tree it records (core v0.0.10). The trees' keys are
+		// in the payload, so a node holds the key to the rule without having
+		// the trees. A commit keyed by core v0.0.9's rule, its own bytes
+		// alone, is refused here, as core's walks and scrubs refuse it.
+		c, err := commit.Decode(payload)
+		if err != nil {
+			return [32]byte{}, nil, fmt.Errorf("commit: %w", err)
+		}
+		want, err := commit.Footprint(uint64(len(payload)), c.Trees())
+		if err != nil {
+			return [32]byte{}, nil, fmt.Errorf("commit: %w", err)
+		}
+		if k.Length() != want {
+			return [32]byte{}, nil, fmt.Errorf("length field %d is not the commit's footprint %d", k.Length(), want)
 		}
 	}
 	return [32]byte(k), append([]byte{}, raw.Bytes...), nil
