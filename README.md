@@ -99,6 +99,13 @@ or two with the default timers (`cluster status` shows its progress);
 the second node's vote is deferred until a third node joins, when the
 catalog goes from one voter to three in one step (§5.4).
 
+`node repair ID` is for a member that lost records but not its
+membership (a restored or partly wiped volume): every other member seals
+its active pack, marks its packs unaudited and, at a random point within
+Δ (10 minutes by default), offers the member whatever it misses. A node
+whose store is gone entirely needs `node remove --dead ID` and a new
+join instead, as its catalog vote went with the store.
+
 A push spreads its batches over every owner at the same distance from
 the client (round-trip times compare in coarse classes, so the nodes of
 a LAN cluster share a client's writes by rank), keeps four batches of

@@ -101,8 +101,13 @@ func (n *Node) Admin(ctx context.Context, req AdminRequest) (AdminReply, error) 
 			return AdminReply{}, err
 		}
 		if req.Op == "node-repair" {
+			if _, ok := n.View().Node(id); !ok {
+				return AdminReply{}, &wire.Error{Code: wire.CodeBadRequest, Text: view.ShortID(id) + " is not a member"}
+			}
+			// Every member, this one included, audits its packs again.
+			n.repairTarget(id)
 			n.broadcastCluster(ctx, &wire.Msg{Type: wire.TViewChanged, Node: id[:]})
-			return AdminReply{Text: "repair scheduled: holders will refill " + view.ShortID(id)}, nil
+			return AdminReply{Text: fmt.Sprintf("repair scheduled: holders will refill %s within %s", view.ShortID(id), n.cfg.Delta)}, nil
 		}
 		fwd := &wire.Msg{Type: wire.TAdmin, Params: codec.MustMarshal(req)}
 		nv, err := n.maint.runAsHolder(ctx, fwd, func(ctx context.Context) (*view.View, error) {
@@ -276,6 +281,22 @@ func (n *Node) broadcastCluster(ctx context.Context, m *wire.Msg) {
 			req := *m // stamped and encoded per goroutine
 			_, _ = n.pool.Call(cctx, id, wire.ALPNCluster, n.stampReq(&req))
 		}(id)
+	}
+}
+
+// repairTarget treats a member as wiped (node repair): it may have lost
+// any of its records, so this node's packs are audited again and the
+// member is offered whatever it misses, at a random point within Δ as
+// after an incarnation change (§8.4). The target itself has nothing to
+// offer itself.
+func (n *Node) repairTarget(id view.NodeID) {
+	if id == n.id {
+		return
+	}
+	if v := n.View(); v != nil {
+		if _, ok := v.Node(id); ok {
+			n.rec.targetWiped(id)
+		}
 	}
 }
 

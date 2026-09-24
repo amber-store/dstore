@@ -420,6 +420,74 @@ func TestClusterRemoveNode(t *testing.T) {
 	}
 }
 
+// TestClusterRepairRefillsWipedNode: a member that lost its packs but not
+// its membership (a wiped volume under a kept identity and catalog) is
+// short every key it owns, and nothing tells the holders until the
+// weekly audit. node repair makes every holder offer it its share again.
+func TestClusterRepairRefillsWipedNode(t *testing.T) {
+	// No GC: a sweep rewrites packs, and a new pack is offered to every
+	// owner, which would refill node 3 by accident.
+	h := cluster3With(t, func(c *node.Config) { c.GCInterval = time.Hour })
+	defer h.close()
+	ctx := context.Background()
+	c := h.client(t, 100)
+	defer c.Close()
+
+	local, root, _ := makeTree(t, 12, 20000)
+	if _, err := c.Push(ctx, local, root, "t", "t", client.Cond{Force: true}, nil); err != nil {
+		t.Fatal(err)
+	}
+	keys, _ := fstree.ReachableKeys(root, local.Get)
+	// full reports whether n holds every key it owns; a node that owns
+	// none yet (no placement) is not full.
+	full := func(n *node.Node) bool {
+		owned := 0
+		for _, k := range keys {
+			if n.Placement().InWriteSet([32]byte(k), n.ID()) {
+				owned++
+				if has, _ := n.Store().Has(k); !has {
+					return false
+				}
+			}
+		}
+		return owned > 0
+	}
+	waitFor(t, 60*time.Second, "node 3 holds its share", func() bool { return full(h.nodes[2]) })
+	// Holders settled: every pack stamped replicated, every recent put
+	// through its first audit (which offers keys to short owners).
+	waitFor(t, 60*time.Second, "holders settled", func() bool {
+		for _, n := range h.nodes {
+			if st := n.Status(ctx); st.PendingPacks != 0 || st.UnauditedKeys != 0 {
+				return false
+			}
+		}
+		return true
+	})
+
+	// Node 3 loses its packs and comes back.
+	h.nodes[2].Close()
+	if err := os.RemoveAll(filepath.Join(h.dirs[2], "packstore")); err != nil {
+		t.Fatal(err)
+	}
+	n3, err := node.Open(h.config(3, h.dirs[2]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.nodes[2] = n3
+	if err := n3.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Past the first audit and Δ, nobody has refilled it on their own.
+	waitFor(t, 30*time.Second, "node 3 placement", func() bool { return n3.Placement() != nil && n3.View() != nil })
+	time.Sleep(3 * time.Second)
+	if full(n3) {
+		t.Fatal("node 3 refilled without a repair: the test proves nothing")
+	}
+	id := n3.ID()
+	h.admin(h.nodes[0], node.AdminRequest{Op: "node-repair", Node: id[:]})
+	waitFor(t, 60*time.Second, "node 3 refilled", func() bool { return full(n3) })
+}
+
 func TestClusterNodeDownDuringWrite(t *testing.T) {
 	h := cluster3(t)
 	defer h.close()
