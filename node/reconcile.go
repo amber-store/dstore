@@ -307,6 +307,9 @@ func (r *reconciler) firstAudit(ctx context.Context) {
 }
 
 // applyWiped marks packs unreplicated for wiped targets whose delay passed.
+// The active segment is sealed first, as for a transition: the audit only
+// visits sealed packs, and records still in the active one would otherwise
+// reach the target only when it fills.
 func (r *reconciler) applyWiped(v *view.View) {
 	r.mu.Lock()
 	var due []view.NodeID
@@ -320,6 +323,7 @@ func (r *reconciler) applyWiped(v *view.View) {
 	if len(due) == 0 {
 		return
 	}
+	r.seal()
 	segs, err := r.n.store.Segments()
 	if err != nil {
 		return

@@ -568,7 +568,7 @@ func nodeCmd() *cli.Command {
 					}
 					return adminAction(c, node.AdminRequest{Op: "node-zone", Node: id, Zone: c.Args().Get(1)})
 				}},
-			{Name: "repair", ArgsUsage: "ID", Flags: clientFlags(),
+			{Name: "repair", Usage: "have every holder offer a member that lost records its share again", ArgsUsage: "ID", Flags: clientFlags(),
 				Action: func(c *cli.Context) error {
 					id, err := idArg(c)
 					if err != nil {

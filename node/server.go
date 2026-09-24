@@ -176,6 +176,9 @@ func (n *Node) serveCluster(ctx context.Context, remote view.NodeID, s transport
 	case wire.TGCAbort:
 		return n.gc.handleAbort(ctx, s, m)
 	case wire.TViewChanged:
+		if len(m.Node) == 32 {
+			n.repairTarget(view.NodeID(m.Node)) // node repair
+		}
 		go n.refreshView()
 		return wire.WriteMsg(s, &wire.Msg{Type: wire.TAck})
 	case wire.TPing:
